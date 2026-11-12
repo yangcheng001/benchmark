@@ -182,6 +182,8 @@ def do_setup():
             parse_requirements('requirements/runtime.txt'),
             'agent':
             parse_requirements('requirements/agent.txt'),
+            'agentx':
+            parse_requirements('requirements/agentx.txt'),
             'full':
             parse_requirements('requirements/extra.txt') +
             parse_requirements('requirements/api.txt') +

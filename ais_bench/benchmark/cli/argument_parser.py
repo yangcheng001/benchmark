@@ -1,8 +1,10 @@
 import argparse
 import json
 from ais_bench.benchmark.cli.utils import (
+    SWEEP_COOLDOWN_SECONDS,
     get_current_time_str,
     validate_batch_size,
+    validate_cooldown,
     validate_max_workers,
     validate_max_workers_per_gpu,
     validate_num_prompts,
@@ -26,6 +28,7 @@ class ArgumentParser():
         self._agent_parser()
         self._api_model_parser()
         self._synthetic_dataset_parser()
+        self._agentx_parser()
 
     def parse_args(self):
         args = self.parser.parse_args()
@@ -74,10 +77,11 @@ class ArgumentParser():
             '-m',
             '--mode',
             help='Running mode. Choose "perf" for performance evaluation, "infer" to run inference only, '
-            '"eval" to evaluate existing inference results, or "viz" to visualize the results. '
+            '"eval" to evaluate existing inference results, "viz" to visualize the results, '
+            'or "agentx" for AgentX session-trace performance. '
             'The default mode is "all", which runs all steps.',
             choices=['all', 'infer', 'eval', 'viz', 'perf', 'perf_viz', 'judge', 'infer_judge',
-                     'agent', 'agent_viz'],
+                     'agent', 'agent_viz', 'agentx'],
             default='all',
             type=str
         )
@@ -123,6 +127,13 @@ class ArgumentParser():
             'It will only be used in the local runner.',
             type=validate_max_workers_per_gpu,
             default=1
+        )
+        parser.add_argument(
+            '--cooldown',
+            help='Seconds to wait between consecutive benchmark tasks. '
+            f'Defaults to {SWEEP_COOLDOWN_SECONDS}; set 0 to disable.',
+            type=validate_cooldown,
+            default=None
         )
         parser.add_argument(
             '--num-prompts',
@@ -423,7 +434,8 @@ class ArgumentParser():
         """
         parser = self.parser.add_argument_group('api_model_args')
         parser.add_argument('--path', type=str, default=None,
-                            help='Path override for all API model configs')
+                            help='Path override for all API model configs. In '
+                            '--mode agentx it is the model/tokenizer path')
         parser.add_argument('--model-name', type=str, default=None,
                             help='Model name override. Written to the `model` or `model_name` '
                             'field depending on the model type. Named --model-name to avoid '
@@ -452,7 +464,10 @@ class ArgumentParser():
                             'single value produces no batch report). Total '
                             'combinations (levels x models x datasets) must not '
                             'exceed 200. Put the positional config before these '
-                            'values, or separate it with "--".')
+                            'values, or separate it with "--". In --mode agentx '
+                            'it is the session-tree concurrency; multiple '
+                            'values run one serial Harness invocation per '
+                            'level, each with its own fresh output directory.')
         parser.add_argument(
             '--trust-remote-code',
             action=argparse.BooleanOptionalAction,
@@ -503,3 +518,59 @@ class ArgumentParser():
         parser.add_argument('--dataset-abbr', type=str, default=None,
                             help='Dataset abbr override (no suffix is appended); '
                             'requires exactly one dataset')
+
+    def _agentx_parser(self):
+        """AgentX 专有参数：支持不写配置文件，直接由命令行发起 profile。
+
+        与 ``--url`` / ``--model-name`` / ``--path`` / ``--api-key`` /
+        ``--model-abbr`` / ``--dataset-abbr`` / ``--trust-remote-code`` 组合使用，例如::
+
+            ais_bench --mode agentx --url http://127.0.0.1:8000 \\
+                --model-name qwen3.8 --path /mnt/weight/Qwen3.8-27B-w8a8 --batch-size 8 \\
+                --agentx-dataset-variant full
+
+        ``--path`` 落到 model 配置的 ``path`` 字段，同时作为 harness 的
+        ``--tokenizer``（等价于配置文件里的 ``models[0].path``）。
+
+        时长 / warmup / seed 默认沿用 ``agentx`` 预设的榜单口径；``--agentx-extra-arg``
+        是通用上游参数入口，原样透传，不做白名单或保留参数校验。命令行传入时整段必须
+        用单引号包住（如 ``--agentx-extra-arg '{ --concurrency 1 --model qwen3.8 }'``），
+        否则 shell 会按空格拆开并报 ``unrecognized arguments``。若通过它覆盖口径参数，
+        结果由用户自行负责与榜单对齐。
+        """
+        parser = self.parser.add_argument_group('agentx_args')
+        parser.add_argument('--endpoint', type=str, default=None,
+                            help='Chat Completions endpoint path appended to --url; '
+                                 'defaults to /v1/chat/completions')
+        parser.add_argument('--agentx-run-mode', choices=['benchmark', 'smoke'], default=None,
+                            help='Execution policy. benchmark preserves the official preset; '
+                            'smoke permits explicit short runs and is never benchmark-valid')
+        parser.add_argument('--agentx-duration', type=float, default=None,
+                            help='Profiling duration in seconds, mapped to '
+                            '--benchmark-duration; benchmark requires >= 900 and '
+                            'defaults to the agentx preset (3600), smoke defaults to 60')
+        parser.add_argument('--agentx-trace-limit', type=int, default=None,
+                            help='Smoke-only trace entry limit, mapped to '
+                            '--num-dataset-entries; defaults to 4 in smoke mode and is '
+                            'forbidden in benchmark mode')
+        parser.add_argument('--agentx-dataset-path', type=str, default=None,
+                            help='Local Weka trace directory (traces.jsonl). When omitted, '
+                            'the public dataset is downloaded by the harness')
+        parser.add_argument('--agentx-dataset-variant', choices=['full', '256k'], default=None,
+                            help='Required trace corpus variant: full or 256k')
+        parser.add_argument('--agentx-python', type=str, default=None,
+                            help='Interpreter that has agentx-harness installed')
+        parser.add_argument('--agentx-bin', type=str, default=None,
+                            help='Explicit agentx executable; by default it is resolved '
+                            'next to --agentx-python')
+        parser.add_argument('--agentx-env', action='append', default=[], metavar='KEY=VALUE',
+                            help='Extra environment variable for the harness subprocess; '
+                            'repeatable')
+        parser.add_argument('--agentx-extra-arg', type=str, default=None, metavar='ARGS',
+                            help='Raw agentx options appended verbatim to the end of the composed '
+                            '`agentx profile` command; options sharing a name with AISBench '
+                            'generated ones take precedence. Quote the whole value with SINGLE '
+                            'quotes so the shell passes it as one argument, e.g. '
+                            "--agentx-extra-arg '{ --concurrency 1 --model qwen3.8 }'. "
+                            'Inner double quotes are allowed; if the value itself contains a '
+                            "single quote, close and reopen it as '\"'\"'")

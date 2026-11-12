@@ -23,13 +23,25 @@ class TaskManager:
 
         from ais_bench.benchmark.cli.workers import WORK_FLOW, WorkFlowExecutor
         run_mode = self.args.mode
-        if run_mode == "perf" and self.args.reuse:
+        reuse_without_run = False
+        if run_mode in ("perf", "agentx") and self.args.reuse:
             self.logger.warning(
-                "Detected --reuse in performance mode. The inference stage will be skipped, "
-                f"and performance metrics will be loaded from the reuse work dir."
+                "Detected --reuse in %s mode. Execution will be skipped and existing "
+                "results will be loaded from the reuse work dir.", run_mode,
             )
-            run_mode = "perf_viz"
+            if run_mode == "perf":
+                run_mode = "perf_viz"
+            else:
+                # AgentX 无独立 viz 模式，reuse 时只保留汇总 worker。
+                reuse_without_run = True
         self.workflow = [worker_class(self.args) for worker_class in WORK_FLOW.get(run_mode)]
+        if reuse_without_run:
+            self.workflow = [worker for worker in self.workflow
+                             if worker.__class__.__name__ != "AgentXRun"]
+        if self.args.mode == "agentx" and self.args.dry_run:
+            # dry-run 只输出执行计划，不尝试汇总不存在的正式结果。
+            self.workflow = [worker for worker in self.workflow
+                             if worker.__class__.__name__ != "AgentXViz"]
 
         # load config
         cfg = self.config_manager.load_config(self.workflow)

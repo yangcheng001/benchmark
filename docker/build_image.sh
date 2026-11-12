@@ -1,7 +1,7 @@
 #!/bin/bash
 
 usage() {
-    echo "用法: $0 --tag <TAG> [--os <操作系统>] [--py-version <Python版本>] [--obs-path <OBS工具路径>] [--hub-repo <镜像仓库>] [--image-output-dir <输出目录>] [--push <0|1>] [--upload <0|1>] [--use-cache <0|1>] [--multi-arch <0|1>]"
+    echo "用法: $0 --tag <TAG> [--os <操作系统>] [--py-version <Python版本>] [--obs-path <OBS工具路径>] [--hub-repo <镜像仓库>] [--image-output-dir <输出目录>] [--push <0|1>] [--upload <0|1>] [--use-cache <0|1>] [--multi-arch <0|1>] [--with-agentx <0|1>]"
     echo ""
     echo "参数说明:"
     echo "  --tag              必填，要更新的TAG名称，遵循AISBench仓库的tag命名规则，且必须是存在的tag，例如v3.1-20260522-master"
@@ -14,6 +14,7 @@ usage() {
     echo "  --upload           可选，是否上传到OBS桶，默认: 0"
     echo "  --use-cache        可选，是否使用缓存构建，默认: 0"
     echo "  --multi-arch       可选，是否构建多架构镜像（amd64+arm64），默认: 0。启用后在各架构机器上分别构建并推送各自架构镜像，再用docker manifest合并为统一tag（不带架构后缀）"
+    echo "  --with-agentx      可选，是否构建预装agentx-harness==1.0.13的-agentx镜像变体，默认: 0；仅支持ubuntu24.04/py312和openeuler24.03/py311"
     echo ""
     echo "示例:"
     echo "  $0 --tag v3.1-20260522-master"
@@ -23,6 +24,7 @@ usage() {
     echo "  $0 --tag v3.1-20260522-master --push 1"
     echo "  $0 --tag v3.1-20260522-master --push 1 --upload 1"
     echo "  $0 --tag v3.1-20260522-master --multi-arch 1 --push 1"
+    echo "  $0 --tag v3.1-20260522-master --os ubuntu24.04 --py-version py312 --with-agentx 1 --push 1"
     exit 1
 }
 
@@ -36,6 +38,7 @@ push=0
 upload=0
 use_cache=0
 multi_arch=0
+with_agentx=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -79,6 +82,10 @@ while [[ $# -gt 0 ]]; do
             multi_arch="$2"
             shift 2
             ;;
+        --with-agentx)
+            with_agentx="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -104,11 +111,32 @@ else
     dockerfile_dir="ubuntu"
 fi
 
-dockerfile_path="$(dirname "$0")/${dockerfile_dir}/Dockerfile.${py_version}.${OS}"
-image_name=${hub_repo}:${TAG}-${OS}-${py_version}-${arch}
-manifest_image_name=${hub_repo}:${TAG}-${OS}-${py_version}
+if [[ "$with_agentx" != "0" && "$with_agentx" != "1" ]]; then
+    echo "错误：--with-agentx 仅支持 0 或 1"
+    exit 1
+fi
 
-offline_pkg_name=ais_bench_benchmark_image_${TAG}-${OS}-${py_version}-${arch}.tar.gz
+image_variant=""
+agentx_python=""
+if [ "$with_agentx" == "1" ]; then
+    if [ "$OS" == "ubuntu24.04" ] && [ "$py_version" == "py312" ]; then
+        agentx_python="python3.12"
+    elif [ "$OS" == "openeuler24.03" ] && [ "$py_version" == "py311" ]; then
+        agentx_python="python3.11"
+    else
+        echo "错误：AgentX 镜像仅支持 ubuntu24.04/py312 和 openeuler24.03/py311"
+        exit 1
+    fi
+    image_variant="-agentx"
+fi
+
+dockerfile_path="$(dirname "$0")/${dockerfile_dir}/Dockerfile.${py_version}.${OS}"
+agentx_dockerfile_path="$(dirname "$0")/agentx/Dockerfile.agentx"
+base_image_name=${hub_repo}:${TAG}-${OS}-${py_version}-${arch}
+image_name=${hub_repo}:${TAG}-${OS}-${py_version}${image_variant}-${arch}
+manifest_image_name=${hub_repo}:${TAG}-${OS}-${py_version}${image_variant}
+
+offline_pkg_name=ais_bench_benchmark_image_${TAG}-${OS}-${py_version}${image_variant}-${arch}.tar.gz
 offline_pkg_full_path=${image_output_dir}/${offline_pkg_name}
 
 if [ ! -f "${dockerfile_path}" ]; then
@@ -117,11 +145,18 @@ if [ ! -f "${dockerfile_path}" ]; then
     exit 1
 fi
 
-echo "开始清理本地旧资源..."
-if docker images -q ${image_name} > /dev/null 2>&1; then
-    docker rmi -f ${image_name}
-    echo "已删除本地旧镜像：${image_name}"
+if [ "$with_agentx" == "1" ] && [ ! -f "${agentx_dockerfile_path}" ]; then
+    echo "错误：AgentX Dockerfile不存在，路径：${agentx_dockerfile_path}"
+    exit 1
 fi
+
+echo "开始清理本地旧资源..."
+for old_image in ${base_image_name} ${image_name}; do
+    if docker images -q ${old_image} > /dev/null 2>&1; then
+        docker rmi -f ${old_image}
+        echo "已删除本地旧镜像：${old_image}"
+    fi
+done
 
 if [ -f "${offline_pkg_full_path}" ]; then
     rm -f "${offline_pkg_full_path}"
@@ -135,7 +170,7 @@ if [ "$use_cache" == "1" ]; then
         --network host \
         --build-arg GIT_TAG=${TAG} \
         -f ${dockerfile_path} \
-        -t ${image_name} \
+        -t ${base_image_name} \
         $(dirname "$0")
 else
     echo "开始构建新镜像（强制不使用缓存，确保更新完整）..."
@@ -145,7 +180,7 @@ else
         --network host \
         --build-arg GIT_TAG=${TAG} \
         -f ${dockerfile_path} \
-        -t ${image_name} \
+        -t ${base_image_name} \
         $(dirname "$0")
 fi
 
@@ -155,7 +190,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "开始验证镜像功能..."
-validation_output=$(docker run --rm ${image_name} ais_bench --models vllm_api_stream_chat --datasets synthetic_gen -s 2>&1)
+validation_output=$(docker run --rm ${base_image_name} ais_bench --models vllm_api_stream_chat --datasets synthetic_gen -s 2>&1)
 validation_status=$?
 
 if [ $validation_status -ne 0 ]; then
@@ -197,7 +232,7 @@ echo "镜像验证成功！"
 
 echo "开始验证 Docker 与 Docker Compose 基本命令..."
 
-docker_version_output=$(docker run --rm ${image_name} docker --version 2>&1)
+docker_version_output=$(docker run --rm ${base_image_name} docker --version 2>&1)
 docker_version_status=$?
 if [ ${docker_version_status} -ne 0 ]; then
     echo "错误：镜像中 docker --version 执行失败（退出码: ${docker_version_status}）"
@@ -205,7 +240,7 @@ if [ ${docker_version_status} -ne 0 ]; then
     exit 1
 fi
 
-compose_version_output=$(docker run --rm ${image_name} docker compose version 2>&1)
+compose_version_output=$(docker run --rm ${base_image_name} docker compose version 2>&1)
 compose_version_status=$?
 if [ ${compose_version_status} -ne 0 ]; then
     echo "错误：镜像中 docker compose version 执行失败（退出码: ${compose_version_status}）"
@@ -213,7 +248,7 @@ if [ ${compose_version_status} -ne 0 ]; then
     exit 1
 fi
 
-dockerd_version_output=$(docker run --rm ${image_name} dockerd --version 2>&1)
+dockerd_version_output=$(docker run --rm ${base_image_name} dockerd --version 2>&1)
 dockerd_version_status=$?
 if [ ${dockerd_version_status} -ne 0 ]; then
     echo "错误：镜像中 dockerd --version 执行失败（退出码: ${dockerd_version_status}）"
@@ -221,7 +256,7 @@ if [ ${dockerd_version_status} -ne 0 ]; then
     exit 1
 fi
 
-buildx_version_output=$(docker run --rm ${image_name} docker buildx version 2>&1)
+buildx_version_output=$(docker run --rm ${base_image_name} docker buildx version 2>&1)
 buildx_version_status=$?
 if [ ${buildx_version_status} -ne 0 ]; then
     echo "错误：镜像中 docker buildx version 执行失败（退出码: ${buildx_version_status}）"
@@ -230,7 +265,7 @@ if [ ${buildx_version_status} -ne 0 ]; then
 fi
 
 # dockerd 二进制存在性二次校验（Docker 27.x 输出与 docker --version 同格式，需确保调用的是 dockerd 而非 docker）
-dockerd_which_output=$(docker run --rm ${image_name} which dockerd 2>&1)
+dockerd_which_output=$(docker run --rm ${base_image_name} which dockerd 2>&1)
 if [ $? -ne 0 ] || [ -z "${dockerd_which_output}" ]; then
     echo "错误：镜像中未找到 dockerd 可执行文件"
     echo "输出：${dockerd_which_output}"
@@ -299,6 +334,53 @@ echo "Docker Compose 验证通过：${compose_ver}"
 echo "buildx 验证通过：${buildx_ver}"
 echo "dockerd 验证通过：${dockerd_version_output}"
 
+if [ "$with_agentx" == "1" ]; then
+    echo "开始构建 AgentX 镜像变体..."
+    agentx_cache_flag="--no-cache"
+    if [ "$use_cache" == "1" ]; then
+        agentx_cache_flag=""
+    fi
+    if ! docker build \
+        ${agentx_cache_flag} \
+        --network host \
+        --build-arg BASE_IMAGE=${base_image_name} \
+        --build-arg AGENTX_PYTHON=${agentx_python} \
+        -f ${agentx_dockerfile_path} \
+        -t ${image_name} \
+        $(dirname "$0"); then
+        echo "错误：AgentX 镜像构建失败，终止后续操作"
+        exit 1
+    fi
+
+    echo "开始验证 AgentX 环境隔离与入口..."
+    if ! docker run --rm ${image_name} /opt/venvs/agentx113/bin/python -m pip check; then
+        echo "错误：AgentX venv 依赖检查失败"
+        exit 1
+    fi
+    if ! docker run --rm ${image_name} /opt/venvs/agentx113/bin/python -c "import importlib.metadata as m,sys; assert sys.version_info[:2] in ((3,11),(3,12),(3,13)); assert m.version('agentx-harness')=='1.0.13'; assert not any((d.metadata.get('Name') or '').lower()=='aiperf' for d in m.distributions())"; then
+        echo "错误：AgentX 版本、Python 版本或 aiperf 冲突检查失败"
+        exit 1
+    fi
+    if ! docker run --rm ${image_name} /opt/venvs/agentx113/bin/agentx --help > /dev/null; then
+        echo "错误：AgentX CLI 自检失败"
+        exit 1
+    fi
+
+    agentx_dry_run_output=$(docker run --rm ${image_name} bash -c 'run_dir=$(mktemp -d) && mkdir -p "$run_dir/model" && ais_bench --mode agentx --url http://127.0.0.1:8000 --model-name qwen3.8 --path "$run_dir/model" --batch-size 1 --work-dir "$run_dir/output" --dry-run' 2>&1)
+    agentx_dry_run_status=$?
+    if [ ${agentx_dry_run_status} -ne 0 ]; then
+        echo "错误：AgentX 零环境参数 dry-run 失败（退出码: ${agentx_dry_run_status}）"
+        echo "${agentx_dry_run_output}"
+        exit 1
+    fi
+    if ! echo "${agentx_dry_run_output}" | grep -F "/opt/venvs/agentx113/bin/python" > /dev/null 2>&1; then
+        echo "错误：AgentX dry-run 未使用镜像固定 venv"
+        echo "${agentx_dry_run_output}"
+        exit 1
+    fi
+    echo "AgentX 镜像验证成功！"
+fi
+
 if [ "$push" == "1" ]; then
     echo "开始推送镜像到远程仓库（覆盖已有同名镜像）..."
     docker push ${image_name}
@@ -313,8 +395,8 @@ if [ "$multi_arch" == "1" ]; then
     if [ "$push" != "1" ]; then
         echo "提示：多架构模式下未开启推送，manifest合并需要已推送的镜像。跳过manifest合并。"
     else
-        arch_image_amd64=${hub_repo}:${TAG}-${OS}-${py_version}-x86_64
-        arch_image_arm64=${hub_repo}:${TAG}-${OS}-${py_version}-aarch64
+        arch_image_amd64=${hub_repo}:${TAG}-${OS}-${py_version}${image_variant}-x86_64
+        arch_image_arm64=${hub_repo}:${TAG}-${OS}-${py_version}${image_variant}-aarch64
 
         echo "开始创建多架构manifest list：${manifest_image_name}"
         echo "  - ${arch_image_amd64}"

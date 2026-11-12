@@ -1,0 +1,332 @@
+import copy
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from mmengine.config import Config, ConfigDict
+
+from ais_bench.benchmark.cli.argument_parser import ArgumentParser
+from ais_bench.benchmark.cli.config_manager import ConfigManager
+from ais_bench.benchmark.cli.task_manager import TaskManager
+from ais_bench.benchmark.cli.workers import (
+    WORK_FLOW,
+    AgentXRun,
+    AgentXViz,
+    WorkFlowExecutor,
+)
+from ais_bench.benchmark.utils.logging.exceptions import AISBenchConfigError
+
+
+class AgentXCLITestBase(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.root = Path(self.temp_dir.name)
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+
+    def parse(self, *extra, include_required=True):
+        argv = ["ais_bench", "--mode", "agentx"]
+        if include_required:
+            argv += [
+                "--url", "http://127.0.0.1:8000",
+                "--model-name", "qwen3.8",
+                "--path", str(self.model_dir),
+                "--agentx-dataset-variant", "full",
+            ]
+        argv += list(extra)
+        with mock.patch.object(sys, "argv", argv), mock.patch(
+            "ais_bench.benchmark.cli.argument_parser.get_current_time_str",
+            return_value="20261106_000000",
+        ):
+            return ArgumentParser().parse_args()
+
+
+class TestAgentXArgumentParser(AgentXCLITestBase):
+    def test_agentx_options_and_batch_size(self):
+        args = self.parse(
+            "--batch-size", "8",
+            "--agentx-run-mode", "smoke",
+            "--agentx-duration", "2.5",
+            "--agentx-trace-limit", "4",
+            "--endpoint", "/custom/v2/chat",
+            "--cooldown", "2.5",
+            "--agentx-dataset-variant", "256k",
+            "--agentx-env", "PUBLIC=value",
+            "--agentx-extra-arg", "--log-level INFO --concurrency 2",
+        )
+        self.assertEqual(args.endpoint, "/custom/v2/chat")
+        self.assertEqual(args.cooldown, 2.5)
+        self.assertEqual(args.batch_size, 8)
+        self.assertEqual(args.agentx_run_mode, "smoke")
+        self.assertEqual(args.agentx_duration, 2.5)
+        self.assertEqual(args.agentx_trace_limit, 4)
+        self.assertEqual(args.agentx_dataset_variant, "256k")
+        self.assertEqual(args.agentx_env, ["PUBLIC=value"])
+        self.assertEqual(args.agentx_extra_arg, "--log-level INFO --concurrency 2")
+
+    def test_agentx_defaults_do_not_override_config(self):
+        args = self.parse()
+        self.assertIsNone(args.endpoint)
+        self.assertIsNone(args.cooldown)
+        self.assertIsNone(args.agentx_run_mode)
+        self.assertIsNone(args.agentx_duration)
+        self.assertIsNone(args.agentx_trace_limit)
+        self.assertIsNone(args.agentx_dataset_path)
+        self.assertEqual(args.agentx_env, [])
+        self.assertIsNone(args.agentx_extra_arg)
+
+
+class TestAgentXConfigManager(AgentXCLITestBase):
+    def test_minimal_cli_builds_model_and_dataset(self):
+        args = self.parse("--batch-size", "8", "--api-key", "secret")
+        cfg = ConfigManager(args)._get_config_from_arg()
+        self.assertTrue(cfg["agentx_cli"])
+        self.assertEqual(len(cfg["models"]), 1)
+        self.assertEqual(len(cfg["datasets"]), 1)
+        model = cfg["models"][0]
+        dataset_args = cfg["datasets"][0]["args"]
+        self.assertEqual(model["model"], "qwen3.8")
+        self.assertEqual(model["url"], "http://127.0.0.1:8000")
+        self.assertNotIn("endpoint", model)
+        self.assertNotIn("endpoint", dataset_args)
+        self.assertEqual(model["path"], str(self.model_dir))
+        self.assertEqual(model["api_key"], "secret")
+        self.assertEqual(dataset_args["concurrency"], 8)
+        self.assertEqual(dataset_args["api_key"], "secret")
+
+    def test_custom_endpoint_is_mapped_to_model(self):
+        args = self.parse("--endpoint", "/custom/v2/chat")
+        cfg = ConfigManager(args)._get_config_from_arg()
+        self.assertEqual(cfg["models"][0]["endpoint"], "/custom/v2/chat")
+        self.assertNotIn("endpoint", cfg["datasets"][0]["args"])
+
+    def test_cooldown_is_mapped_to_dataset_args(self):
+        args = self.parse("--cooldown", "1.5")
+        cfg = ConfigManager(args)._get_config_from_arg()
+        self.assertEqual(cfg["datasets"][0]["args"]["cooldown"], 1.5)
+
+    def test_invalid_cooldown_is_rejected_before_execution(self):
+        with self.assertRaisesRegex(AISBenchConfigError, "non-negative finite"):
+            self.parse("--cooldown", "-1")
+
+    def test_invalid_endpoint_is_rejected_before_execution(self):
+        for endpoint in ("v1/chat/completions", "/v1/chat?x=1", "/v1 chat"):
+            with self.subTest(endpoint=endpoint):
+                args = self.parse("--endpoint", endpoint)
+                with self.assertRaisesRegex(AISBenchConfigError, "endpoint must be"):
+                    ConfigManager(args)._get_config_from_arg()
+
+    def test_smoke_cli_fields_are_mapped(self):
+        args = self.parse(
+            "--agentx-run-mode", "smoke",
+            "--agentx-duration", "2",
+            "--agentx-trace-limit", "3",
+        )
+        cfg = ConfigManager(args)._get_config_from_arg()
+        dataset_args = cfg["datasets"][0]["args"]
+        self.assertEqual(dataset_args["run_mode"], "smoke")
+        self.assertEqual(dataset_args["duration"], 2)
+        self.assertEqual(dataset_args["trace_limit"], 3)
+
+    def test_missing_url_and_model_fail_early(self):
+        for extra in (["--model-name", "qwen3.8"], ["--url", "http://127.0.0.1:8000"]):
+            with self.subTest(extra=extra):
+                args = self.parse(*extra, include_required=False)
+                with self.assertRaises(AISBenchConfigError):
+                    ConfigManager(args)._get_config_from_arg()
+
+    def test_missing_variant_fails_early(self):
+        args = self.parse(
+            "--url", "http://127.0.0.1:8000",
+            "--model-name", "qwen3.8",
+            "--path", str(self.model_dir),
+            include_required=False,
+        )
+        with self.assertRaisesRegex(AISBenchConfigError, "agentx-dataset-variant"):
+            ConfigManager(args)._get_config_from_arg()
+
+    def test_multiple_concurrency_levels_are_mapped(self):
+        args = self.parse("--batch-size", "1", "8", "32")
+        cfg = ConfigManager(args)._get_config_from_arg()
+        self.assertEqual(cfg["datasets"][0]["args"]["concurrency"], [1, 8, 32])
+
+    def test_duplicate_concurrency_levels_are_rejected(self):
+        args = self.parse("--batch-size", "8", "8")
+        with self.assertRaisesRegex(AISBenchConfigError, "duplicated"):
+            ConfigManager(args)._get_config_from_arg()
+
+    def test_incompatible_perf_arguments_are_rejected(self):
+        args = self.parse("--num-prompts", "8")
+        with self.assertRaisesRegex(AISBenchConfigError, "ordinary perf/infer"):
+            ConfigManager(args)._get_config_from_arg()
+
+    def test_full_chat_completions_url_is_rejected_before_execution(self):
+        args = self.parse(
+            "--url", "http://127.0.0.1:8000/v1/chat/completions",
+            "--model-name", "qwen3.8",
+            "--path", str(self.model_dir),
+            "--agentx-dataset-variant", "full",
+            include_required=False,
+        )
+        with self.assertRaisesRegex(AISBenchConfigError, "base URL without"):
+            ConfigManager(args)._get_config_from_arg()
+
+    def test_explicit_cli_overrides_config_and_unset_values_preserve_it(self):
+        config = ConfigDict({
+            "models": [{
+                "abbr": "old", "model": "old-model", "path": str(self.model_dir),
+                "url": "http://old:8000", "endpoint": "/config/chat",
+                "trust_remote_code": False,
+            }],
+            "datasets": [{"abbr": "old-data", "args": {
+                "concurrency": 2, "cooldown": 3.0, "variant": "full",
+            }}],
+        })
+        args = self.parse(
+            "--batch-size", "8", "--model-name", "qwen3.8next",
+            "--model-abbr", "new", "--dataset-abbr", "new-data",
+            "--trust-remote-code", "--endpoint", "/cli/chat",
+            "--cooldown", "1.5",
+        )
+        ConfigManager(args)._apply_agentx_cli_overrides(config)
+        self.assertEqual(config["models"][0]["model"], "qwen3.8next")
+        self.assertEqual(config["models"][0]["abbr"], "new")
+        self.assertTrue(config["models"][0]["trust_remote_code"])
+        self.assertEqual(config["datasets"][0]["abbr"], "new-data")
+        self.assertEqual(config["datasets"][0]["args"]["concurrency"], 8)
+        self.assertEqual(config["datasets"][0]["args"]["cooldown"], 1.5)
+        self.assertEqual(config["datasets"][0]["args"]["variant"], "full")
+        self.assertEqual(config["models"][0]["endpoint"], "/cli/chat")
+        self.assertNotIn("endpoint", config["datasets"][0]["args"])
+
+        preserved = ConfigDict({
+            "models": [dict(self._valid_model(), endpoint="/config/chat")],
+            "datasets": [{"abbr": "data", "args": {"concurrency": 3, "cooldown": 4}}],
+        })
+        args = self.parse()
+        ConfigManager(args)._apply_agentx_cli_overrides(preserved)
+        self.assertEqual(preserved["datasets"][0]["args"]["concurrency"], 3)
+        # --cooldown 只认 CLI，配置文件里的同名字段不参与
+        self.assertEqual(preserved["datasets"][0]["args"]["cooldown"], 5)
+        self.assertEqual(preserved["models"][0]["endpoint"], "/config/chat")
+        self.assertEqual(preserved["models"][0]["model"], "qwen3.8")
+
+    def test_config_file_uses_agentx_override_without_model_type(self):
+        config_path = self.root / "agentx_config.py"
+        config_path.write_text(
+            "models = [dict(abbr='cfg', model='qwen3.8', "
+            f"path={str(self.model_dir)!r}, "
+            "url='http://127.0.0.1:8000')]\n"
+            "datasets = [dict(abbr='weka', args=dict(concurrency=2, variant='full'))]\n",
+            encoding="utf-8",
+        )
+        args = self.parse("--model-name", "qwen3.8next", str(config_path))
+        cfg = ConfigManager(args)._get_config_from_arg()
+        self.assertEqual(cfg["models"][0]["model"], "qwen3.8next")
+        self.assertEqual(cfg["datasets"][0]["args"]["concurrency"], 2)
+        self.assertNotIn("type", cfg["models"][0])
+
+    def _valid_model(self):
+        return {
+            "abbr": "qwen",
+            "model": "qwen3.8",
+            "path": str(self.model_dir),
+            "url": "http://127.0.0.1:8000",
+        }
+
+    def test_snapshot_is_redacted_and_memory_secrets_are_restored(self):
+        args = self.parse("--api-key", "secret", "--agentx-env", "API_TOKEN=env-token-value", "--agentx-env", "PUBLIC=visible")
+        manager = ConfigManager(args)
+        manager.cfg_time_str = "20261106_000000"
+        manager.cfg = Config({
+            "work_dir": str(self.root / "work"),
+            "models": [dict(self._valid_model(), api_key="secret")],
+            "datasets": [{
+                "abbr": "data",
+                "args": {
+                    "concurrency": 1,
+                    "api_key": "secret",
+                    "env": {"API_TOKEN": "env-token-value", "PUBLIC": "visible"},
+                },
+            }],
+            "cli_args": vars(args),
+        })
+        (self.root / "work" / "configs").mkdir(parents=True)
+        manager._dump_and_reload_config()
+        snapshots = list((self.root / "work" / "configs").glob("*.py"))
+        self.assertEqual(len(snapshots), 1)
+        content = snapshots[0].read_text(encoding="utf-8")
+        self.assertNotIn("secret", content)
+        self.assertNotIn("env-token-value", content)
+        self.assertIn("<redacted>", content)
+        self.assertIn("visible", content)
+        self.assertEqual(manager.cfg["models"][0]["api_key"], "secret")
+        self.assertEqual(manager.cfg["datasets"][0]["args"]["api_key"], "secret")
+        self.assertEqual(manager.cfg["datasets"][0]["args"]["env"]["API_TOKEN"], "env-token-value")
+        self.assertEqual(manager.cfg["datasets"][0]["args"]["env"]["PUBLIC"], "visible")
+
+
+class TestAgentXLifecycle(unittest.TestCase):
+    def test_workflow_registration(self):
+        self.assertEqual(WORK_FLOW["agentx"], [AgentXRun, AgentXViz])
+        self.assertNotIn("agentx_viz", WORK_FLOW)
+
+    def test_worker_directly_executes_task_without_partitioner(self):
+        task = mock.MagicMock()
+        with mock.patch("ais_bench.benchmark.cli.workers.TASKS.build", return_value=task) as build:
+            AgentXRun(SimpleNamespace(dry_run=False)).do_work(ConfigDict({"models": [], "datasets": []}))
+        build.assert_called_once()
+        task.run.assert_called_once_with()
+        task.dry_run.assert_not_called()
+
+        task.reset_mock()
+        with mock.patch("ais_bench.benchmark.cli.workers.TASKS.build", return_value=task):
+            AgentXRun(SimpleNamespace(dry_run=True)).do_work(ConfigDict({"models": [], "datasets": []}))
+        task.dry_run.assert_called_once_with()
+        task.run.assert_not_called()
+
+    def test_reuse_becomes_viz_and_dry_run_skips_viz(self):
+        for reuse, dry_run, expected in (("latest", False, [AgentXViz]), (None, True, [AgentXRun])):
+            with self.subTest(reuse=reuse, dry_run=dry_run):
+                manager = TaskManager.__new__(TaskManager)
+                manager.logger = mock.MagicMock()
+                manager.args = SimpleNamespace(
+                    search=False, mode="agentx", reuse=reuse, dry_run=dry_run
+                )
+                manager.config_manager = mock.MagicMock()
+                manager.config_manager.load_config.return_value = ConfigDict({"work_dir": "unused"})
+                with mock.patch("ais_bench.benchmark.cli.workers.WorkFlowExecutor") as executor:
+                    manager.run()
+                workflow = manager.config_manager.load_config.call_args.args[0]
+                self.assertEqual([type(worker) for worker in workflow], expected)
+                executor.return_value.execute.assert_called_once_with()
+
+    def test_run_failure_is_raised_after_viz(self):
+        events = []
+
+        class AgentXRun:
+            response_anomaly_coordinator = None
+
+            def do_work(self, cfg):
+                events.append("run")
+                raise RuntimeError("harness failed")
+
+        class AgentXViz:
+            response_anomaly_coordinator = None
+
+            def do_work(self, cfg):
+                events.append("viz")
+
+        executor = WorkFlowExecutor(ConfigDict({"work_dir": "unused"}), [AgentXRun(), AgentXViz()])
+        with self.assertRaisesRegex(RuntimeError, "harness failed"):
+            executor.execute()
+        self.assertEqual(events, ["run", "viz"])
+
+
+if __name__ == "__main__":
+    unittest.main()

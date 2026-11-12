@@ -1,0 +1,23 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG AGENTX_PYTHON=python3.12
+
+RUN case "${AGENTX_PYTHON}" in \
+        python3.11|python3.12) ;; \
+        *) echo "AGENTX_PYTHON must be python3.11 or python3.12" >&2; exit 1 ;; \
+    esac && \
+    ${AGENTX_PYTHON} -m venv /opt/venvs/agentx113 && \
+    /opt/venvs/agentx113/bin/python -m pip install --no-cache-dir \
+        -r /benchmark/requirements/agentx.txt \
+        -i https://repo.huaweicloud.com/repository/pypi/simple \
+        --trusted-host repo.huaweicloud.com \
+        --use-pep517 && \
+    /opt/venvs/agentx113/bin/python -m pip check && \
+    /opt/venvs/agentx113/bin/python -c "import importlib.metadata as m,sys; assert sys.version_info[:2] in ((3,11),(3,12),(3,13)); assert m.version('agentx-harness')=='1.0.13'; assert not any((d.metadata.get('Name') or '').lower()=='aiperf' for d in m.distributions())" && \
+    /opt/venvs/agentx113/bin/agentx --help > /dev/null && \
+    ${AGENTX_PYTHON} -c "import ais_bench,importlib.metadata as m; assert not any((d.metadata.get('Name') or '').lower()=='agentx-harness' for d in m.distributions())"
+
+ENV AISBENCH_AGENTX_PYTHON=/opt/venvs/agentx113/bin/python
+
+WORKDIR /benchmark

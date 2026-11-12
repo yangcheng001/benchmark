@@ -139,7 +139,7 @@ class TestInfer:
         assert cfg['infer']['runner']['debug'] == True
 
     def test_update_cfg_skips_sweep_cooldown_without_sweep(self):
-        """老命令（配置无 sweep_cooldown_s）不向 runner 注入新参数"""
+        """配置无 sweep_cooldown_s 时不向 runner 注入该参数"""
         cfg = MockConfigDict({
             'models': [{'attr': 'service', 'abbr': 'test_model'}],
             'datasets': [{'abbr': 'test_dataset', 'infer_cfg': {'retriever': {}}}],
@@ -153,7 +153,7 @@ class TestInfer:
         assert 'sweep_cooldown_s' not in cfg['infer']['runner']
 
     def test_update_cfg_injects_sweep_cooldown_for_multi_sweep(self):
-        """多档 sweep 写入 sweep_cooldown_s 时才注入到 runner 配置"""
+        """配置写入 sweep_cooldown_s（--cooldown）时注入到 runner 配置"""
         cfg = MockConfigDict({
             'models': [{'attr': 'service', 'abbr': 'test_model'}],
             'datasets': [{'abbr': 'test_dataset', 'infer_cfg': {'retriever': {}}}],
