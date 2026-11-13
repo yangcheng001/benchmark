@@ -366,7 +366,7 @@ if [ "$with_agentx" == "1" ]; then
         exit 1
     fi
 
-    agentx_dry_run_output=$(docker run --rm ${image_name} bash -c 'run_dir=$(mktemp -d) && mkdir -p "$run_dir/model" && ais_bench --mode agentx --url http://127.0.0.1:8000 --model-name qwen3.8 --path "$run_dir/model" --batch-size 1 --work-dir "$run_dir/output" --dry-run' 2>&1)
+    agentx_dry_run_output=$(docker run --rm ${image_name} bash -c 'run_dir=$(mktemp -d) && mkdir -p "$run_dir/model" && ais_bench --mode agentx --url http://127.0.0.1:8000 --model-name qwen3.8 --path "$run_dir/model" --batch-size 1 --agentx-dataset-variant 256k --work-dir "$run_dir/output" --dry-run' 2>&1)
     agentx_dry_run_status=$?
     if [ ${agentx_dry_run_status} -ne 0 ]; then
         echo "错误：AgentX 零环境参数 dry-run 失败（退出码: ${agentx_dry_run_status}）"

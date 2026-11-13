@@ -150,6 +150,20 @@ class TestAgentXConfigManager(AgentXCLITestBase):
         with self.assertRaisesRegex(AISBenchConfigError, "agentx-dataset-variant"):
             ConfigManager(args)._get_config_from_arg()
 
+    def test_reuse_still_requires_startup_args(self):
+        """无配置文件时 --reuse 只复用产物目录，仍要求 url/model-name/dataset-variant"""
+        for reuse in ("latest", "20261106_000000"):
+            with self.subTest(reuse=reuse):
+                args = self.parse("--reuse", reuse, include_required=False)
+                with self.assertRaisesRegex(AISBenchConfigError, "requires"):
+                    ConfigManager(args)._get_config_from_arg()
+
+    def test_reuse_with_dry_run_is_rejected(self):
+        """reuse 要求重跑覆盖、dry-run 要求零写入，组合必须在配置期拒绝。"""
+        args = self.parse("--reuse", "latest", "--dry-run")
+        with self.assertRaisesRegex(AISBenchConfigError, "--reuse cannot be combined"):
+            ConfigManager(args)._get_config_from_arg()
+
     def test_multiple_concurrency_levels_are_mapped(self):
         args = self.parse("--batch-size", "1", "8", "32")
         cfg = ConfigManager(args)._get_config_from_arg()
@@ -215,6 +229,25 @@ class TestAgentXConfigManager(AgentXCLITestBase):
         self.assertEqual(preserved["datasets"][0]["args"]["cooldown"], 5)
         self.assertEqual(preserved["models"][0]["endpoint"], "/config/chat")
         self.assertEqual(preserved["models"][0]["model"], "qwen3.8")
+
+    def test_agentx_env_merges_with_config_env_by_key(self):
+        """--agentx-env 按键合并配置 env：CLI 同名键覆盖，其余保留"""
+        config = ConfigDict({
+            "models": [self._valid_model()],
+            "datasets": [{"abbr": "data", "args": {
+                "concurrency": 2, "variant": "full",
+                "env": {"API_TOKEN": "cfg-token", "PUBLIC": "cfg-public"},
+            }}],
+        })
+        args = self.parse(
+            "--agentx-env", "PUBLIC=cli-public",
+            "--agentx-env", "EXTRA=cli-extra",
+        )
+        ConfigManager(args)._apply_agentx_cli_overrides(config)
+        env = config["datasets"][0]["args"]["env"]
+        self.assertEqual(env["API_TOKEN"], "cfg-token")
+        self.assertEqual(env["PUBLIC"], "cli-public")
+        self.assertEqual(env["EXTRA"], "cli-extra")
 
     def test_config_file_uses_agentx_override_without_model_type(self):
         config_path = self.root / "agentx_config.py"
@@ -290,8 +323,11 @@ class TestAgentXLifecycle(unittest.TestCase):
         task.dry_run.assert_called_once_with()
         task.run.assert_not_called()
 
-    def test_reuse_becomes_viz_and_dry_run_skips_viz(self):
-        for reuse, dry_run, expected in (("latest", False, [AgentXViz]), (None, True, [AgentXRun])):
+    def test_reuse_keeps_full_workflow_and_dry_run_skips_viz(self):
+        for reuse, dry_run, expected in (
+            ("latest", False, [AgentXRun, AgentXViz]),
+            (None, True, [AgentXRun]),
+        ):
             with self.subTest(reuse=reuse, dry_run=dry_run):
                 manager = TaskManager.__new__(TaskManager)
                 manager.logger = mock.MagicMock()

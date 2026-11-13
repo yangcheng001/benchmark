@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import sys
@@ -99,7 +100,7 @@ class TestAgentXFakeHarnessIntegration(unittest.TestCase):
         })
         return AgentXTask(cfg), work_dir
 
-    def run_task(self, task, mode):
+    def run_task(self, task, mode, probe_engine=None):
         metadata = {
             "distribution": "agentx-harness",
             "version": "1.0.13",
@@ -124,7 +125,7 @@ class TestAgentXFakeHarnessIntegration(unittest.TestCase):
             "ais_bench.benchmark.tasks.custom_tasks.agentx_task.probe_harness_environment",
             return_value=metadata,
         ), mock.patch.object(
-            AgentXTask, "_probe_engine", return_value=(engine, [])
+            AgentXTask, "_probe_engine", probe_engine if probe_engine is not None else (engine, [])
         ), mock.patch.dict(os.environ, {"FAKE_AGENTX_MODE": mode}, clear=False):
             return task.run()
 
@@ -296,6 +297,51 @@ class TestAgentXFakeHarnessIntegration(unittest.TestCase):
                 if mode == "cancelled":
                     self.assertTrue(manifest["result"]["was_cancelled"])
                     self.assertIn("AGENTX_CANCELLED", {item["code"] for item in manifest["result"]["errors"]})
+
+    def test_engine_probe_crash_keeps_manifest_evidence(self):
+        # 探测异常（如 IncompleteRead）必须降级为失败记录，不能吞掉整档 manifest。
+        task, work_dir = self.make_task("probe_crash")
+        crashing = mock.Mock(side_effect=http.client.IncompleteRead(b"partial"))
+        result = self.run_task(task, "success", probe_engine=crashing)
+        self.assertEqual(result["run"]["status"], "completed")
+        self.assertTrue(result["run"]["benchmark_valid"])
+        manifest = self.load_manifest(task, work_dir)
+        self.assertIsNone(manifest["engine"])
+        self.assertEqual(
+            manifest["result"]["errors"][0]["code"], "AGENTX_ENGINE_PROBE_FAILED"
+        )
+
+    def test_extra_arg_api_key_is_added_to_secrets(self):
+        # --agentx-extra-arg 传入的 --api-key 取值也要进脱敏名单；
+        # 上游按 "api-key=" 回显时不匹配 --api-key 正则，只能靠名单兜底。
+        task, work_dir = self.make_task("extra_key", extra_args="--api-key extra-secret")
+        result = self.run_task(task, "success")
+        self.assertTrue(result["run"]["benchmark_valid"])
+        logs_dir = work_dir / "logs" / "agentx_full_batchsize_2"
+        stdout_log = (logs_dir / "agentx_stdout.log").read_text(encoding="utf-8")
+        self.assertNotIn("extra-secret", stdout_log)
+        self.assertIn("fake harness api-key=<redacted>", stdout_log)
+        manifest_text = (
+            self.run_dir(work_dir, 2) / "manifest.json"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("extra-secret", manifest_text)
+
+    def test_test_params_follow_effective_argv(self):
+        # test_params 与最终生效 argv 口径一致：extra args 覆盖 duration/seed/warmup 后，
+        # 不再出现 test_params 与 agentx_command.parameters 互相矛盾的记录。
+        task, work_dir = self.make_task(
+            "params_argv", duration=1000,
+            extra_args="--benchmark-duration 1800 --random-seed 7 --num-warmup-requests 5",
+        )
+        self.run_task(task, "success")
+        manifest = self.load_manifest(task, work_dir)
+        self.assertEqual(manifest["test_params"]["benchmark_duration_s"], 1800.0)
+        self.assertEqual(manifest["test_params"]["random_seed"], 7)
+        self.assertEqual(manifest["test_params"]["warmup_requests_per_lane"], 5)
+        parameters = manifest["agentx_command"]["parameters"]
+        self.assertEqual(parameters["--benchmark-duration"], "1800")
+        self.assertEqual(parameters["--random-seed"], "7")
+        self.assertEqual(parameters["--num-warmup-requests"], "5")
 
 
 if __name__ == "__main__":

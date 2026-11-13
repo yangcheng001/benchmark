@@ -137,6 +137,54 @@ class TestAgentXResultAdapter(unittest.TestCase):
         )
         self.assertEqual(empty["run"]["comparison_scope"], "internal_only")
 
+    def test_completed_without_metrics_is_not_benchmark_valid(self):
+        # 退出码 0、解析成功但 summary 无任何指标：data_status=unavailable 时
+        # benchmark_valid 不能仍为 True，comparison_scope 不能仍是 official_agentx。
+        empty = normalized(raw={
+            "schema_version": "1.4",
+            "metadata": {"submission_valid": True, "submission_invalid_reasons": []},
+        })
+        self.assertEqual(empty["run"]["data_status"], "unavailable")
+        self.assertFalse(empty["run"]["benchmark_valid"])
+        self.assertEqual(empty["run"]["comparison_scope"], "invalid")
+        self.assertEqual(empty["validity"]["primary_invalid_reason"], "data_status:unavailable")
+        self.assertIn("data_status:unavailable", empty["validity"]["all_invalid_reasons"])
+
+        # 数据不完整只作为归档根因，run_status 仍是对外主根因。
+        partial = normalized(run={"status": "failed"}, raw=raw_summary())
+        self.assertEqual(partial["run"]["data_status"], "partial")
+        self.assertEqual(partial["validity"]["primary_invalid_reason"], "run_status:failed")
+        self.assertIn("data_status:partial", partial["validity"]["all_invalid_reasons"])
+
+    def test_dataset_verification_requires_recorded_state(self):
+        # verification 未按 *_verified 状态标记命名（缺失/空/非字符串项）时判 provenance 未验证；
+        # not_verified 与 local_content_hash_verified 一样是显式记录的验证状态。
+        for verification in ([], ["pending"], [True], "local_content_hash_verified"):
+            with self.subTest(verification=verification):
+                result = normalized(dataset={"verification": verification})
+                self.assertIn(
+                    "dataset_provenance_unverified",
+                    result["validity"]["aisbench_invalid_reasons"],
+                )
+        self.assertNotIn(
+            "dataset_provenance_unverified",
+            normalized()["validity"]["aisbench_invalid_reasons"],
+        )
+
+    def test_unhashable_harness_reasons_do_not_block_result(self):
+        raw = raw_summary()
+        raw["metadata"]["submission_valid"] = False
+        raw["metadata"]["submission_invalid_reasons"] = [{"code": "coverage", "ratio": 0.5}]
+        result = normalized(raw)
+        # 原因项统一转字符串，dict.fromkeys 去重不再抛 TypeError，整档证据可正常落盘。
+        self.assertEqual(
+            result["validity"]["harness_invalid_reasons"],
+            ["{'code': 'coverage', 'ratio': 0.5}"],
+        )
+        self.assertEqual(result["validity"]["primary_invalid_reason"],
+                         "{'code': 'coverage', 'ratio': 0.5}")
+        json.dumps(result, allow_nan=False)
+
     def test_missing_metrics_unknown_schema_and_non_finite_values(self):
         empty = normalized(raw={})
         self.assertEqual(empty["run"]["data_status"], "unavailable")

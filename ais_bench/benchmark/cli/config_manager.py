@@ -721,6 +721,12 @@ class ConfigManager:
         self.table.append(["--summarizer", s[0], os.path.abspath(s[1])])
 
     def _get_config_from_arg(self):
+        if self.args.mode == 'agentx' and self.args.reuse and self.args.dry_run:
+            # reuse 要重跑并覆盖产物，dry-run 要求零写入；组合只会得到空 workflow 并静默退出。
+            raise AISBenchConfigError(
+                TMAN_CODES.INVALID_ARG_VALUE_IN_CMD,
+                '--reuse cannot be combined with --dry-run in agentx mode.'
+            )
         if not self.args.config and self.args.mode == 'agentx':
             return self._build_agentx_config_from_cli()
         if self.args.config:
@@ -765,6 +771,8 @@ class ConfigManager:
         datasets = []
 
         if args.mode == 'agentx':
+            # --reuse 只影响产物目录（沿用已有时间戳目录并覆盖原结果），
+            # 仍按正常启动参数构造配置并重新执行 Harness。
             self._reject_agentx_incompatible_args()
             missing = [
                 flag for flag, value in (
@@ -868,8 +876,6 @@ class ConfigManager:
 
     def _apply_agentx_cli_overrides(self, config):
         """配置文件与纯 CLI 共用显式覆盖规则和启动前校验。"""
-        if self.args.mode == 'agentx' and self.args.reuse:
-            return
         self._reject_agentx_incompatible_args()
         models = config.get('models') or []
         datasets = config.get('datasets') or []
@@ -912,7 +918,11 @@ class ConfigManager:
         if getattr(self.args, 'agentx_extra_arg', None):
             dataset_args['extra_args'] = self.args.agentx_extra_arg
         if getattr(self.args, 'agentx_env', None):
-            dataset_args['env'] = self._parse_agentx_env(self.args.agentx_env)
+            # 与 agent 模式 --agent-env 同语义：按键合并，CLI 同名键覆盖、其余保留
+            dataset_args['env'] = {
+                **(dataset_args.get('env') or {}),
+                **self._parse_agentx_env(self.args.agentx_env),
+            }
         datasets[0]['args'] = dataset_args
         from ais_bench.benchmark.tasks.custom_tasks.agentx_task import validate_agentx_args
         try:

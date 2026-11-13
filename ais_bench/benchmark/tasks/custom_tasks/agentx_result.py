@@ -55,6 +55,17 @@ def _has_metrics(raw: Dict[str, Any]) -> bool:
     )
 
 
+def _verification_recorded(verification: Any) -> bool:
+    """验证方式是否已记录：verification 列表须含 *_verified 状态标记。
+
+    ``not_verified`` 与 ``local_content_hash_verified`` 一样是显式记录的验证状态；
+    缺失、空列表或未按 *_verified 命名的项视为验证方式未记录。
+    """
+    return isinstance(verification, list) and any(
+        isinstance(item, str) and item.endswith("_verified") for item in verification
+    )
+
+
 def normalize_agentx_result(
     raw: Optional[Dict[str, Any]],
     *,
@@ -86,7 +97,9 @@ def normalize_agentx_result(
         submission_valid = None
     harness_reasons = metadata.get("submission_invalid_reasons") or []
     if not isinstance(harness_reasons, list):
-        harness_reasons = [str(harness_reasons)]
+        harness_reasons = [harness_reasons]
+    # 原因项统一转字符串：上游给出非字符串（如对象）时也能安全去重，不阻断 manifest 落盘。
+    harness_reasons = [str(item) for item in harness_reasons]
 
     aisbench_reasons: List[str] = []
     is_benchmark = run.get("mode") == "benchmark"
@@ -106,7 +119,10 @@ def normalize_agentx_result(
     elif submission_valid is not True:
         # 上游给出的具体提交原因优先作为根因；缺失时才用概括标记。
         aisbench_reasons.append(harness_reasons[0] if harness_reasons else "harness_submission_not_valid")
-    if dataset.get("source") not in ("public", "local") or not dataset.get("verification"):
+    if data_status != "complete":
+        # 数据不可用/不完整时没有可判有效的正式结果；run/parse/上游提交原因优先作根因。
+        aisbench_reasons.append(f"data_status:{data_status}")
+    if dataset.get("source") not in ("public", "local") or not _verification_recorded(dataset.get("verification")):
         aisbench_reasons.append("dataset_provenance_unverified")
     if dataset.get("sha256_mismatch"):
         aisbench_reasons.append("dataset_sha256_mismatch")

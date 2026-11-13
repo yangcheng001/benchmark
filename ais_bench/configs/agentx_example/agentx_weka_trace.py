@@ -24,13 +24,14 @@
 
 - ``--agentx-python``：显式指定 Conda/venv 中的 Harness 解释器，也可使用 ``AISBENCH_AGENTX_PYTHON``；
 - ``--agentx-env HF_ENDPOINT=https://hf-mirror.com``：给子进程注入环境变量（可重复）；
+  也支持 ``--agentx-env AGENTX_PROCESS_TIMEOUT=7200`` 为 Harness 设置看门狗超时（秒，默认不启用）；
 - ``--agentx-extra-arg '{ --log-level INFO }'``：直接写出 agentx 原始参数，追加到
   组合好的 ``agentx profile`` 命令末尾；与已有参数重名时以这里的值为准。
   shell 侧必须用**单引号**包住整段，否则空格会把它拆成多个 AISBench 参数并报
   ``unrecognized arguments``；段内可用双引号，如
   ``--agentx-extra-arg '{ --concurrency 2 --goodput "time_to_first_token:10000" }'``；
   值里若含单引号，用 ``'"'"'`` 拼接；不要用中文弯引号；
-- ``--reuse latest``：跳过 Harness，只重新汇总 ``--work-dir`` 下已有结果。
+- ``--reuse latest``：沿用 ``--work-dir`` 下最近的时间戳目录重跑，产物覆盖原结果。
 
 本配置只驱动上游 ``agentx-harness`` 的 ``agentx`` 预设，不实现 Trace 回放：
 

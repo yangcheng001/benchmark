@@ -4,6 +4,7 @@ import os.path as osp
 import copy
 import shutil
 import json
+import inspect
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -30,6 +31,31 @@ from ais_bench.benchmark.utils.response_anomaly import (
 )
 
 logger = AISLogger()
+
+
+def _runner_accepts_sweep_cooldown(runner_type) -> bool:
+    """检查 runner 构造器是否接受 ``sweep_cooldown_s`` 参数。
+
+    自定义 runner 的 ``__init__`` 可能既没有该形参也没有 ``**kwargs``，
+    无差别注入会在 ``RUNNERS.build`` 时抛 TypeError，因此先按签名判断。
+    """
+    if runner_type is None:
+        # 未指定 runner 时默认落到 LocalRunner，其构造器接受该参数
+        return True
+    if isinstance(runner_type, str):
+        runner_type = RUNNERS.get(runner_type)
+    if not isinstance(runner_type, type):
+        return False
+    try:
+        params = inspect.signature(runner_type.__init__).parameters
+    except (TypeError, ValueError):
+        return False
+    if 'sweep_cooldown_s' in params:
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in params.values()
+    )
 
 
 class _URLSnapshotEntry(NamedTuple):
@@ -102,8 +128,10 @@ class Infer(BaseWorker):
             runner_cfg['max_num_workers'] = self.args.max_num_workers
             runner_cfg['max_workers_per_gpu'] = self.args.max_workers_per_gpu
             runner_cfg['debug'] = self.args.debug or cfg.cli_args.debug
-            # --cooldown 写入配置后注入 runner，控制相邻任务之间的等待
-            if 'sweep_cooldown_s' in cfg:
+            # --cooldown 写入配置后注入 runner，控制相邻任务之间的等待；
+            # 构造器不接受该参数的自定义 runner 跳过注入，避免 build 时 TypeError
+            if 'sweep_cooldown_s' in cfg and _runner_accepts_sweep_cooldown(
+                    runner_cfg.get('type')):
                 runner_cfg['sweep_cooldown_s'] = cfg['sweep_cooldown_s']
 
         if cfg.get('infer'):
@@ -953,7 +981,7 @@ class AgentXRun(BaseWorker):
 
 
 class AgentXViz(BaseWorker):
-    """跨档位打印 AgentX 汇总表格并刷新各档位 summary 日志。"""
+    """校验 AgentX 各档位汇总结果并刷新档位 summary 日志。"""
 
     def update_cfg(self, cfg: ConfigDict) -> None:
         from ais_bench.benchmark.summarizers import AgentXSummarizer
@@ -980,11 +1008,8 @@ class AgentXViz(BaseWorker):
         summarizer_cfg = cfg.get("summarizer", {})
         summarizer_cfg["config"] = cfg
         summarizer = build_from_cfg(summarizer_cfg)
-        # 正常流程中每个档位跑完已即时打印；仅 --reuse 复用已有产物时需要统一打印。
-        reuse = bool(getattr(self.args, "reuse", False))
-        if reuse:
-            logger.info("Summarizing AgentX performance results...")
-        summarizer.summarize(print_table=reuse)
+        # 各档位表格已在 AgentXRun 内即时打印，这里只做校验和 summary 刷新。
+        summarizer.summarize(print_table=False)
 
 
 WORK_FLOW = dict(

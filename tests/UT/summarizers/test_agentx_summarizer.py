@@ -180,9 +180,79 @@ class TestAgentXSummarizer(unittest.TestCase):
             ).is_file()
         )
 
+    def test_summarize_degrades_row_when_summary_unreadable(self):
+        # 载入失败时该行必须降级：不再出现 benchmark_valid=True 但指标全 N/A 的矛盾。
+        run_dir = write_run(self.work_dir)
+        (run_dir / "agentx_summary.json").write_text("{bad", encoding="utf-8")
+        with mock.patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "AGENTX_RESULT_INVALID"):
+                self.summarizer.summarize()
+        summary_log = (
+            self.work_dir / "logs" / "agentx_full_batchsize_8" / "agentx_summary.log"
+        ).read_text(encoding="utf-8")
+        self.assertIn("summary_load_failed", summary_log)
+        self.assertIn("False", summary_log)
+        self.assertNotIn("official_agentx", summary_log)
+
+    def test_summarize_degrades_row_when_summary_not_archived(self):
+        # summary_json 为 None 时同样降级并记录根因，不允许静默通过。
+        manifest = make_manifest()
+        manifest["result"]["summary_json"] = None
+        write_run(self.work_dir, manifest)
+        with mock.patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "AGENTX_RESULT_INVALID"):
+                self.summarizer.summarize()
+        summary_log = (
+            self.work_dir / "logs" / "agentx_full_batchsize_8" / "agentx_summary.log"
+        ).read_text(encoding="utf-8")
+        self.assertIn("summary_missing", summary_log)
+        self.assertIn("False", summary_log)
+        self.assertNotIn("official_agentx", summary_log)
+
+    def test_finalize_run_reads_console_log_from_raw_artifact_dir(self):
+        # console 日志路径从 raw_artifact_dir 派生（不再硬编码 agentx_raw），
+        # 内容与 agentx_stdout.log 同规则脱敏并剥离品牌前缀；上游原始文件不改。
+        run_dir = self.work_dir / "performances" / "agentx_full_batchsize_8"
+        raw_dir = run_dir / "custom_raw"
+        raw_dir.mkdir(parents=True)
+        (raw_dir / "profile_export_aiperf.json").write_text(
+            json.dumps(make_raw()), encoding="utf-8"
+        )
+        (raw_dir / "profile_export_console.log").write_text(
+            "NVIDIA AIPerf | ready --api-key sk-leak\n", encoding="utf-8"
+        )
+        logs_dir = self.work_dir / "logs" / "agentx_full_batchsize_8"
+        self.summarizer.finalize_run(str(run_dir), make_manifest(), str(raw_dir), str(logs_dir))
+        summary_log = (logs_dir / "agentx_summary.log").read_text(encoding="utf-8")
+        self.assertIn("ready --api-key <redacted>", summary_log)
+        self.assertNotIn("sk-leak", summary_log)
+        self.assertNotIn("NVIDIA AIPerf", summary_log)
+        written = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["result"]["raw_artifacts"], "custom_raw")
+
     def test_no_manifests_is_explicit_error(self):
         with self.assertRaisesRegex(RuntimeError, "AGENTX_RESULT_MISSING"):
             self.summarizer.summarize()
+
+    def test_slot_with_artifacts_but_no_manifest_is_degraded(self):
+        """有产物但 manifest 未写成时显式降级，不能静默丢档。"""
+        run_dir = self.work_dir / "performances" / "agentx_full_batchsize_8"
+        raw_dir = run_dir / "agentx_raw"
+        raw_dir.mkdir(parents=True)
+        (raw_dir / "profile_export_aiperf.json").write_text(
+            json.dumps(make_raw()), encoding="utf-8"
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "AGENTX_RESULT_INVALID"):
+            self.summarizer.summarize(print_table=False)
+        self.assertTrue(
+            (self.work_dir / "logs" / "agentx_full_batchsize_8" / "agentx_summary.log").is_file()
+        )
+
+    def test_slot_without_artifacts_is_ignored(self):
+        (self.work_dir / "performances" / "agentx_full_batchsize_8").mkdir(parents=True)
+        with self.assertRaisesRegex(RuntimeError, "AGENTX_RESULT_MISSING"):
+            self.summarizer.summarize(print_table=False)
 
 
 if __name__ == "__main__":

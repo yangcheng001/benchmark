@@ -1,3 +1,4 @@
+import http.client
 import json
 import os
 import os.path as osp
@@ -14,7 +15,11 @@ from ais_bench.benchmark.tasks.custom_tasks.agentx_task import (
     AGENTX_SUMMARY_NAME,
     DATASETS,
     IMAGE_HARNESS_PYTHON,
+    PROCESS_TIMEOUT_ENV,
     AgentXTask,
+    _extra_arg_secrets,
+    _http_json,
+    _process_timeout,
     build_agentx_command,
     probe_harness_environment,
     redact_command,
@@ -302,6 +307,45 @@ class TestAgentXCommand(AgentXTaskTestBase):
         self.assertIn("--api-key=<redacted>", redacted)
         self.assertEqual(redacted[-1], "m")
 
+    def test_command_redaction_does_not_forge_tail_value(self):
+        # --api-key 位于末尾时没有取值，不能凭空补一个 <redacted>。
+        self.assertEqual(redact_command(["agentx", "--api-key"]), ["agentx", "--api-key"])
+
+    def test_tokenizer_path_is_expanded(self):
+        command = build_agentx_command(
+            ["agentx"], url="http://127.0.0.1:8000", model="m", concurrency=1,
+            dataset_alias=DATASETS["full"]["alias"], artifact_dir="/out/benchmark",
+            tokenizer_path="~/tokenizer",
+        )
+        self.assertEqual(command[command.index("--tokenizer") + 1], osp.expanduser("~/tokenizer"))
+
+    def test_process_timeout_env(self):
+        self.assertIsNone(_process_timeout({}))
+        self.assertEqual(_process_timeout({PROCESS_TIMEOUT_ENV: "1800"}), 1800.0)
+        for bad in ("0", "-5", "abc", "nan"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    _process_timeout({PROCESS_TIMEOUT_ENV: bad})
+
+    def test_extra_arg_secrets_collect_known_sensitive_values(self):
+        self.assertEqual(
+            _extra_arg_secrets("--api-key k1 --api-key=k2 --log-level INFO"),
+            ["k1", "k2"],
+        )
+        self.assertEqual(_extra_arg_secrets(None), [])
+        self.assertEqual(_extra_arg_secrets("--log-level INFO"), [])
+
+    def test_http_json_degrades_http_exceptions_to_error(self):
+        # IncompleteRead 等 HTTPException 不是 URLError/OSError/ValueError，
+        # 必须同样降级为探测错误，不能逃逸吞掉整档结果。
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=http.client.IncompleteRead(b"partial"),
+        ):
+            payload, error = _http_json("http://127.0.0.1:8000/version")
+        self.assertIsNone(payload)
+        self.assertIn("IncompleteRead", error)
+
 
 class TestAgentXDatasetAndEnvironment(AgentXTaskTestBase):
     def test_local_hash_match_and_mismatch_policy(self):
@@ -340,6 +384,10 @@ class TestAgentXDatasetAndEnvironment(AgentXTaskTestBase):
             metadata = probe_harness_environment("python", {}, agentx_bin="agentx")
         self.assertEqual(metadata["version"], "1.0.13")
         self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            # 子进程一律按 UTF-8 解码，非 UTF-8 locale 下上游输出不会中断整档测评。
+            self.assertEqual(call.kwargs.get("encoding"), "utf-8")
+            self.assertEqual(call.kwargs.get("errors"), "replace")
 
     def test_probe_rejects_python_version_harness_version_and_aiperf(self):
         cases = (
@@ -396,6 +444,10 @@ class TestAgentXDatasetAndEnvironment(AgentXTaskTestBase):
         self.assertEqual(
             resolve_agentx_bin("/custom/agentx", str(python_exe)), ["/custom/agentx"]
         )
+        # 校验阶段按 expanduser 判定存在，执行阶段必须同样展开。
+        self.assertEqual(
+            resolve_agentx_bin("~/agentx", str(python_exe)), [osp.expanduser("~/agentx")]
+        )
 
 
 class TestAgentXTaskLifecycle(AgentXTaskTestBase):
@@ -428,6 +480,80 @@ class TestAgentXTaskLifecycle(AgentXTaskTestBase):
         self.assertNotIn("secret", content)
         self.assertIn("<redacted>", content)
         self.assertEqual(plan["runs"][0]["run_id"], "agentx_full_batchsize_8")
+
+    def test_reuse_clears_previous_run_artifacts(self):
+        """--reuse 只复用时间戳目录：清空该档位旧产物后重跑，不因目录非空失败"""
+        run_id = "agentx_full_batchsize_8"
+        artifact_dir = self.work_dir / "performances" / run_id / "agentx_raw"
+        artifact_dir.mkdir(parents=True)
+        stale = artifact_dir / "summary_export.json"
+        stale.write_text("{}", encoding="utf-8")
+        logs_dir = self.work_dir / "logs" / run_id
+        logs_dir.mkdir(parents=True)
+        (logs_dir / "agentx_summary.log").write_text("stale", encoding="utf-8")
+
+        task = AgentXTask(ConfigDict({
+            "work_dir": str(self.work_dir),
+            "models": [self.model_cfg()],
+            "datasets": [{"abbr": "weka", "args": self.dataset_args()}],
+            "cli_args": {"debug": False, "reuse": "latest"},
+        }))
+        completed = {
+            "run": {
+                "status": "completed", "parse_status": "success",
+                "benchmark_valid": True, "comparison_scope": "official_agentx",
+            },
+            "artifacts": {"harness_log": "agentx_stdout.log"},
+        }
+        with mock.patch(
+            "ais_bench.benchmark.tasks.custom_tasks.agentx_task.resolve_harness_python",
+            return_value="python",
+        ), mock.patch(
+            "ais_bench.benchmark.tasks.custom_tasks.agentx_task.probe_harness_environment",
+            return_value=self.harness_metadata(),
+        ), mock.patch.object(task, "_execute_plan", return_value=completed):
+            task.run()
+
+        self.assertFalse(stale.exists())
+        self.assertTrue(artifact_dir.is_dir())
+        self.assertFalse((logs_dir / "agentx_summary.log").exists())
+
+    def test_run_rejects_existing_artifacts_without_reuse(self):
+        run_id = "agentx_full_batchsize_8"
+        artifact_dir = self.work_dir / "performances" / run_id / "agentx_raw"
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "summary_export.json").write_text("{}", encoding="utf-8")
+        task = self.task()
+        with mock.patch(
+            "ais_bench.benchmark.tasks.custom_tasks.agentx_task.resolve_harness_python",
+            return_value="python",
+        ), mock.patch(
+            "ais_bench.benchmark.tasks.custom_tasks.agentx_task.probe_harness_environment",
+            return_value=self.harness_metadata(),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "AGENTX_OUTPUT_WRITE_FAILED"):
+                task.run()
+
+    def test_cancelled_run_does_not_record_process_failure(self):
+        """取消时退出码来自我方 kill，不应同时记 AGENTX_PROCESS_FAILED。"""
+        task = self.task()
+        with mock.patch(
+            "ais_bench.benchmark.tasks.custom_tasks.agentx_task.resolve_harness_python",
+            return_value="python",
+        ), mock.patch(
+            "ais_bench.benchmark.tasks.custom_tasks.agentx_task.probe_harness_environment",
+            return_value=self.harness_metadata(),
+        ):
+            plan = task._prepare()[0]
+        with mock.patch.object(task, "_execute", return_value=(-9, True, None, None)), \
+                mock.patch.object(
+                    task, "_read_summary", return_value=({}, "missing", "no summary")), \
+                mock.patch.object(task, "_probe_engine", return_value=(None, [])):
+            result = task._execute_plan(plan)
+
+        codes = [item["code"] for item in result["errors"]]
+        self.assertNotIn("AGENTX_PROCESS_FAILED", codes)
+        self.assertIn("AGENTX_CANCELLED", codes)
 
     def test_smoke_defaults_are_applied_when_unset(self):
         self.assertEqual(resolve_smoke_overrides("smoke", None, None), (60.0, 4))

@@ -12,13 +12,14 @@ import os
 import os.path as osp
 import platform
 import re
+import select
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,24 @@ _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 # 上游 AIPerf 的结果表标题和帮助头带 "NVIDIA AIPerf |" 品牌前缀，
 # 控制台回显与 agentx_stdout 日志均去掉；上游原始产物（summary/CSV 等）保持原样。
 _SCREEN_BRAND_RE = re.compile(r"NVIDIA\s+AIPerf\s*\|\s*")
+
+PROCESS_TIMEOUT_ENV = "AGENTX_PROCESS_TIMEOUT"
+
+
+def _process_timeout(env: Dict[str, str]) -> Optional[float]:
+    """读取 Harness 看门狗超时（秒）；未设置时返回 None 表示不启用。"""
+    raw = (env or {}).get(PROCESS_TIMEOUT_ENV)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{PROCESS_TIMEOUT_ENV} must be a positive number of seconds, got {raw!r}."
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{PROCESS_TIMEOUT_ENV} must be a positive number of seconds, got {raw!r}.")
+    return value
 
 
 def resolve_variant(variant: Optional[str]) -> str:
@@ -374,7 +393,7 @@ def build_agentx_command(
             raise ValueError("AgentX public dataset alias is required when dataset_dir is absent.")
         command += ["--public-dataset", dataset_alias]
     if tokenizer_path:
-        command += ["--tokenizer", tokenizer_path]
+        command += ["--tokenizer", osp.expanduser(tokenizer_path)]
         if tokenizer_trust_remote_code:
             command += ["--tokenizer-trust-remote-code"]
     if api_key:
@@ -400,7 +419,8 @@ def redact_command(command: List[str]) -> List[str]:
             redact_next = False
             continue
         if token in _REDACT_NEXT_FLAGS:
-            redacted.extend([token, "<redacted>"] if token == command[-1] else [token])
+            # 旗标后若没有取值（位于末尾），不能凭空补一个 <redacted> 值。
+            redacted.append(token)
             redact_next = True
             continue
         matched_secret = False
@@ -444,7 +464,8 @@ def probe_harness_environment(python_exe: str, env: Dict[str, str],
     )
     try:
         completed = subprocess.run([python_exe, "-c", code], stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, timeout=120, env=env)
+                                   stderr=subprocess.PIPE, text=True, timeout=120, env=env,
+                                   encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"AGENTX_ENV_INVALID: cannot query {python_exe!r}: {exc}") from exc
     if completed.returncode != 0:
@@ -469,7 +490,8 @@ def probe_harness_environment(python_exe: str, env: Dict[str, str],
     command = resolve_agentx_bin(agentx_bin, python_exe)
     try:
         help_result = subprocess.run(command + ["--help"], stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, timeout=30, env=env)
+                                     stderr=subprocess.STDOUT, text=True, timeout=30, env=env,
+                                     encoding="utf-8", errors="replace")
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"AGENTX_ENV_INVALID: agentx entry self-check failed: {exc}") from exc
     if help_result.returncode != 0:
@@ -485,7 +507,8 @@ def probe_harness_version(python_exe: Optional[str], env: Optional[Dict[str, str
 
 def resolve_agentx_bin(agentx_bin: Optional[str], python_exe: Optional[str]) -> List[str]:
     if agentx_bin:
-        return [agentx_bin]
+        # 校验阶段按 expanduser 判定可执行文件存在，执行阶段必须同样展开。
+        return [osp.expanduser(agentx_bin)]
     candidates: List[str] = []
     if python_exe:
         bin_dir = Path(python_exe).resolve().parent
@@ -530,19 +553,22 @@ def _http_json(url: str, timeout: float = ENGINE_PROBE_TIMEOUT) -> Tuple[Optiona
         request = urllib.request.Request(url, headers={"Accept": "application/json"})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8")), None
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except Exception as exc:
+        # IncompleteRead 等 HTTPException 逃逸会吞掉整档结果，探测失败一律降级为错误记录。
         return None, str(exc)
 
 
-def _extra_arg_value(extra_args: Optional[str], flag: str) -> Optional[str]:
-    """从 ``--agentx-extra-arg`` 中读取显式覆盖值；仅用于 manifest 记录。"""
-    args = _split_extra_args(extra_args)
-    for index, token in enumerate(args):
-        if token == flag and index + 1 < len(args):
-            return args[index + 1]
-        if token.startswith(flag + "="):
-            return token.split("=", 1)[1]
-    return None
+def _extra_arg_secrets(extra_args: Optional[str]) -> List[str]:
+    """把 extra args 中已知敏感选项（如 ``--api-key``）的取值纳入脱敏名单。"""
+    tokens = _split_extra_args(extra_args)
+    secrets: List[str] = []
+    for index, token in enumerate(tokens):
+        for flag in _REDACT_NEXT_FLAGS:
+            if token == flag and index + 1 < len(tokens):
+                secrets.append(tokens[index + 1])
+            elif token.startswith(flag + "="):
+                secrets.append(token.split("=", 1)[1])
+    return [secret for secret in secrets if secret]
 
 
 @TASKS.register_module()
@@ -570,7 +596,7 @@ class AgentXTask(BaseTask):
 
     def run(self, task_state_manager: Optional[TaskStateManager] = None) -> Dict[str, Any]:
         self.task_state_manager = task_state_manager
-        plans = self._prepare()
+        plans = self._prepare(clear_existing=self._reuse_enabled())
         results: List[Dict[str, Any]] = []
         for index, plan in enumerate(plans):
             self._update_state({"status": "start", "stage": "agentx", "run_id": plan["run_id"]})
@@ -615,7 +641,11 @@ class AgentXTask(BaseTask):
         )
         return payload
 
-    def _prepare(self) -> List[Dict[str, Any]]:
+    def _reuse_enabled(self) -> bool:
+        """--reuse 在 AgentX 模式下只复用时间戳目录，重跑结果覆盖原产物。"""
+        return bool((self.cfg.get("cli_args") or {}).get("reuse"))
+
+    def _prepare(self, clear_existing: bool = False) -> List[Dict[str, Any]]:
         levels = validate_agentx_args(self.model_cfg, self.args)
         cooldown = resolve_cooldown(self.args.get("cooldown"))
         run_mode = self.args.get("run_mode") or "benchmark"
@@ -643,6 +673,7 @@ class AgentXTask(BaseTask):
             value for key, value in (self.args.get("env") or {}).items()
             if _SECRET_ENV_RE.search(key) and value
         )
+        secrets.extend(_extra_arg_secrets(self.args.get("extra_args")))
         plans = []
         for concurrency in levels:
             run_id = run_dir_name(dataset["variant"], concurrency)
@@ -650,7 +681,12 @@ class AgentXTask(BaseTask):
             run_dir = osp.abspath(osp.join(self.work_dir, "performances", run_id))
             logs_dir = osp.abspath(osp.join(self.work_dir, "logs", run_id))
             artifact_dir = osp.join(run_dir, "agentx_raw")
-            if osp.exists(artifact_dir) and os.listdir(artifact_dir):
+            if clear_existing:
+                # reuse 复用同一时间戳目录：清空该档位旧产物后重跑，结果覆盖原目录。
+                for directory in (run_dir, logs_dir):
+                    if osp.exists(directory):
+                        shutil.rmtree(directory)
+            elif osp.exists(artifact_dir) and os.listdir(artifact_dir):
                 raise RuntimeError(
                     f"AGENTX_OUTPUT_WRITE_FAILED: artifact directory is not empty: {artifact_dir}"
                 )
@@ -756,7 +792,7 @@ class AgentXTask(BaseTask):
     def _execute_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         started_wall = datetime.now(timezone.utc).isoformat()
         started = time.monotonic()
-        return_code, cancelled, start_error = self._execute(
+        return_code, cancelled, start_error, timeout_error = self._execute(
             plan["argv"], plan["log_path"], plan["env"], plan["run_id"],
             plan.get("secrets") or [], plan["adapter_log"],
         )
@@ -765,7 +801,15 @@ class AgentXTask(BaseTask):
         entries = self._dataset_entries(dataset, raw)
         if entries is not None:
             dataset["num_dataset_entries"] = entries
-        engine, probe_errors = self._probe_engine(plan)
+        try:
+            engine, probe_errors = self._probe_engine(plan)
+        except Exception as exc:
+            # 探测只是附加信息：兜底降级为失败记录，确保 manifest 必定落盘。
+            engine = None
+            probe_errors = [{
+                "code": "AGENTX_ENGINE_PROBE_FAILED",
+                "message": f"engine probe crashed: {exc}",
+            }]
         was_cancelled = cancelled or bool(raw.get("was_cancelled"))
         if start_error:
             status = "start_failed"
@@ -778,7 +822,10 @@ class AgentXTask(BaseTask):
         errors = list(probe_errors)
         if start_error:
             errors.append({"code": "AGENTX_PROCESS_START_FAILED", "message": start_error})
-        if return_code not in (0, None):
+        if timeout_error:
+            errors.append({"code": "AGENTX_PROCESS_TIMEOUT", "message": timeout_error})
+        elif return_code not in (0, None) and not was_cancelled:
+            # 取消路径的退出码来自我方 kill，不是 Harness 故障，不重复记 PROCESS_FAILED。
             errors.append({"code": "AGENTX_PROCESS_FAILED", "message": f"Harness exited with {return_code}."})
         if parse_error:
             code = "AGENTX_RESULT_SCHEMA_UNSUPPORTED" if parse_status == "unsupported_schema" else (
@@ -992,7 +1039,6 @@ class AgentXTask(BaseTask):
     def _test_params(self, plan: Dict[str, Any], raw: Dict[str, Any]) -> Dict[str, Any]:
         metadata = raw.get("metadata") if isinstance(raw, dict) else None
         config = metadata.get("config") if isinstance(metadata, dict) else None
-        extra_args = self.args.get("extra_args")
 
         def pick(*keys):
             for source in (config, metadata):
@@ -1002,9 +1048,11 @@ class AgentXTask(BaseTask):
                             return source[key]
             return None
 
-        duration = plan.get("duration")
-        if duration is None:
-            duration = _extra_arg_value(extra_args, "--benchmark-duration")
+        # 以 extra args 覆盖后的最终生效 argv 推导，保证与 agentx_command.parameters 一致；
+        # argv 未显式给出时回退上游 summary 报告的实际值，再回退 preset 默认。
+        parameters = _argv_parameters(plan["argv"])
+
+        duration = parameters.get("--benchmark-duration")
         if duration is None:
             duration = pick("benchmark_duration", "benchmark_duration_s", "duration")
         if duration is None:
@@ -1015,7 +1063,7 @@ class AgentXTask(BaseTask):
             except ValueError:
                 pass
 
-        seed = _extra_arg_value(extra_args, "--random-seed") or _extra_arg_value(extra_args, "--seed")
+        seed = parameters.get("--random-seed") or parameters.get("--seed")
         if seed is None:
             seed = pick("random_seed", "seed")
         if seed is None:
@@ -1026,9 +1074,16 @@ class AgentXTask(BaseTask):
             except ValueError:
                 pass
 
-        warmup = pick("warmup_requests_per_lane", "num_warmup_requests", "warmup_requests")
+        warmup = parameters.get("--num-warmup-requests")
+        if warmup is None:
+            warmup = pick("warmup_requests_per_lane", "num_warmup_requests", "warmup_requests")
         if warmup is None:
             warmup = PRESET_WARMUP_REQUESTS_PER_LANE
+        if isinstance(warmup, str):
+            try:
+                warmup = int(warmup)
+            except ValueError:
+                pass
         return {
             "batch_size": plan["concurrency"],
             "benchmark_duration_s": duration,
@@ -1062,12 +1117,18 @@ class AgentXTask(BaseTask):
 
     def _execute(self, command: List[str], log_path: str, env: Dict[str, str], run_id: str,
                  secrets: Optional[List[str]] = None, adapter_log: Optional[str] = None
-                 ) -> Tuple[Optional[int], bool, Optional[str]]:
-        """流式消费日志；取消和异常路径均回收整个进程树。"""
+                 ) -> Tuple[Optional[int], bool, Optional[str], Optional[str]]:
+        """流式消费日志；取消、超时和异常路径均回收整个进程树。"""
         secrets = secrets or []
+        try:
+            timeout = _process_timeout(env)
+        except ValueError as exc:
+            return None, False, str(exc), None
         popen_kwargs: Dict[str, Any] = {"start_new_session": True}
         process: Optional[subprocess.Popen] = None
         cancelled = False
+        finished = threading.Event()
+        timed_out = threading.Event()
         try:
             with open(log_path, "w", encoding="utf-8") as log_file:
                 log_file.write(f"AISBench AgentX run_id={run_id}\n")
@@ -1077,13 +1138,20 @@ class AgentXTask(BaseTask):
                         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, bufsize=1, env=env,
                         cwd=osp.dirname(osp.dirname(osp.dirname(log_path))),
+                        encoding="utf-8", errors="replace",
                         **popen_kwargs,
                     )
                 except OSError as exc:
-                    return None, False, str(exc)
+                    return None, False, str(exc), None
                 if adapter_log:
                     self._append_log(adapter_log, f"started run_id={run_id} pid={process.pid}")
                 assert process.stdout is not None
+                if timeout is not None:
+                    # 看门狗避免 Harness hang 死时 AISBench 永久阻塞在读行上。
+                    threading.Thread(
+                        target=self._watchdog, args=(process, timeout, finished, timed_out),
+                        name=f"agentx-watchdog-{run_id}", daemon=True,
+                    ).start()
                 try:
                     for line in process.stdout:
                         safe_line = _screen_line(_redact_text(line, secrets))
@@ -1091,21 +1159,70 @@ class AgentXTask(BaseTask):
                         log_file.flush()
                         self.logger.info("%s", safe_line.rstrip())
                         self._update_state({"stage": "agentx", "run_id": run_id})
-                    return process.wait(), cancelled, None
+                    return_code = process.wait()
+                    finished.set()
+                    timeout_error = None
+                    if timed_out.is_set():
+                        timeout_error = (
+                            f"Harness did not exit within {PROCESS_TIMEOUT_ENV}={timeout:g}s "
+                            "and was terminated."
+                        )
+                    return return_code, cancelled, None, timeout_error
                 except KeyboardInterrupt:
                     cancelled = True
                     if adapter_log:
                         self._append_log(adapter_log, f"cancellation requested run_id={run_id}")
+                    # 先非阻塞排空管道里已到达的尾部输出（常含取消原因），再回收进程组。
+                    self._drain_stdout(process, log_file, secrets)
                     code = self._terminate(process)
-                    return code, True, None
+                    self._drain_stdout(process, log_file, secrets)
+                    return code, True, None, None
                 except BaseException:
+                    self._drain_stdout(process, log_file, secrets)
                     self._terminate(process)
                     raise
         finally:
+            finished.set()
             if process is not None and process.poll() is None:
                 self._terminate(process)
             if process is not None and process.stdout is not None:
                 process.stdout.close()
+
+    @staticmethod
+    def _watchdog(process: subprocess.Popen, timeout: float,
+                  finished: threading.Event, timed_out: threading.Event) -> None:
+        """超时未结束时回收整个进程组，从而解除主线程的阻塞读。"""
+        if finished.wait(timeout):
+            return
+        timed_out.set()
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _drain_stdout(self, process: subprocess.Popen, log_file, secrets: List[str]) -> None:
+        """非阻塞读取已到达的 stdout，避免取消/超时时丢掉管道缓冲的日志尾部。"""
+        stream = process.stdout
+        if stream is None:
+            return
+        try:
+            fd = stream.fileno()
+        except (OSError, ValueError):
+            return
+        while True:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+            except (OSError, ValueError):
+                return
+            if not ready:
+                return
+            line = stream.readline()
+            if not line:
+                return
+            safe_line = _screen_line(_redact_text(line, secrets))
+            log_file.write(safe_line)
+            log_file.flush()
+            self.logger.info("%s", safe_line.rstrip())
 
     @staticmethod
     def _terminate(process: subprocess.Popen) -> int:

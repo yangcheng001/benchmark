@@ -187,14 +187,16 @@ class AgentXSummarizer:
             result["summary_csv"] = SUMMARY_CSV_NAME
         else:
             result["summary_csv"] = None
-        result["raw_artifacts"] = "agentx_raw" if osp.isdir(raw_artifact_dir) else None
+        result["raw_artifacts"] = (
+            osp.basename(raw_artifact_dir) if osp.isdir(raw_artifact_dir) else None
+        )
         atomic_write_json(osp.join(run_dir, "manifest.json"), manifest)
 
         run_id = manifest.get("run_id") or osp.basename(run_dir)
         log_dir = logs_dir or osp.join(self.work_dir, LOGS_DIR, run_id)
         raw, _error = self._load_summary(run_dir, result.get("summary_json"))
         row = manifest_row(manifest, raw, self.work_dir, run_dir)
-        self._write_summary_log(log_dir, row, run_dir)
+        self._write_summary_log(log_dir, row, raw_artifact_dir)
         # 每个档位跑完立即打印本档位结果，而不是等全部档位结束后统一打印。
         self.print_rows([row])
         return manifest
@@ -233,10 +235,10 @@ class AgentXSummarizer:
         return (raw if isinstance(raw, dict) else {}), None
 
     def _write_summary_log(self, log_dir: str, row: Dict[str, Any],
-                           run_dir: Optional[str] = None) -> str:
+                           raw_artifact_dir: Optional[str] = None) -> str:
         """逐档位 summary 日志：屏幕同款表格 + 明细 + 上游控制台输出。"""
         lines = [render_table([row])] + self._row_detail_lines(row)
-        console_lines = self._console_log_lines(run_dir)
+        console_lines = self._console_log_lines(raw_artifact_dir)
         if console_lines:
             lines.append("")
             lines.extend(console_lines)
@@ -244,28 +246,41 @@ class AgentXSummarizer:
         _atomic_text(path, "\n".join(lines) + "\n")
         return path
 
-    def _console_log_lines(self, run_dir: Optional[str]) -> List[str]:
-        """读取 ``agentx_raw/profile_export_console.log``，去掉 NVIDIA AIPerf 品牌前缀。"""
-        if not run_dir:
+    def _console_log_lines(self, raw_artifact_dir: Optional[str]) -> List[str]:
+        """读取 raw_artifact_dir 下的 console 日志，脱敏并去掉 NVIDIA AIPerf 品牌前缀。"""
+        if not raw_artifact_dir:
             return []
-        path = osp.join(run_dir, "agentx_raw", RAW_CONSOLE_NAME)
+        path = osp.join(raw_artifact_dir, RAW_CONSOLE_NAME)
         if not osp.isfile(path):
             return []
+        # 与 agentx_stdout.log 同一脱敏函数；延后导入避免与 agentx_task 相互循环。
+        from ais_bench.benchmark.tasks.custom_tasks.agentx_task import _redact_text
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as file:
-                return [_BRAND_PREFIX_RE.sub("", line.rstrip("\r\n")) for line in file]
+                return [
+                    _BRAND_PREFIX_RE.sub("", _redact_text(line.rstrip("\r\n"), []))
+                    for line in file
+                ]
         except OSError:
             return []
 
-    def _discover(self) -> List[str]:
-        return sorted(
-            str(path)
-            for path in Path(self.work_dir, PERFORMANCES_DIR).glob("*/manifest.json")
-        )
+    def _discover(self) -> Tuple[List[str], List[str]]:
+        """返回 (manifest 路径, 有产物但缺 manifest 的档位目录)。"""
+        perf_root = Path(self.work_dir, PERFORMANCES_DIR)
+        paths = sorted(str(path) for path in perf_root.glob("*/manifest.json"))
+        with_manifest = {osp.dirname(path) for path in paths}
+        missing: List[str] = []
+        for run_dir in sorted(perf_root.glob("agentx_*")):
+            if not run_dir.is_dir() or str(run_dir) in with_manifest:
+                continue
+            raw_dir = run_dir / "agentx_raw"
+            if raw_dir.is_dir() and any(raw_dir.iterdir()):
+                missing.append(str(run_dir))
+        return paths, missing
 
     def summarize(self, time_str=None, print_table: bool = True) -> Dict[str, Any]:
-        paths = self._discover()
-        if not paths:
+        paths, missing_dirs = self._discover()
+        if not paths and not missing_dirs:
             raise RuntimeError(
                 "AGENTX_RESULT_MISSING: no manifest.json under "
                 f"{self.work_dir}/{PERFORMANCES_DIR}/agentx_<variant>_batchsize_<N>"
@@ -273,6 +288,19 @@ class AgentXSummarizer:
         manifests: List[Dict[str, Any]] = []
         rows: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
+        for run_dir in missing_dirs:
+            # 档位目录有产物但 manifest 未写成（被 kill、磁盘满等）：显式降级，不静默丢档。
+            manifest_path = osp.join(run_dir, "manifest.json")
+            errors.append({"manifest_path": manifest_path, "error": "manifest_missing"})
+            row = {
+                "schema_version": None, "run_id": Path(run_dir).name,
+                "status": "failed", "data_status": "unavailable",
+                "benchmark_valid": False, "comparison_scope": "invalid",
+                "invalid_reasons": ["manifest_missing"],
+                "manifest_path": osp.relpath(manifest_path, self.work_dir),
+            }
+            rows.append(row)
+            self._write_summary_log(osp.join(self.work_dir, LOGS_DIR, row["run_id"]), row)
         for path in paths:
             run_dir = osp.dirname(path)
             try:
@@ -292,13 +320,29 @@ class AgentXSummarizer:
                 continue
             result = manifest.get("result") or {}
             raw, summary_error = self._load_summary(run_dir, result.get("summary_json"))
+            summary_reason = None
             if summary_error:
+                summary_reason = f"summary_load_failed:{summary_error}"
                 errors.append({"manifest_path": path, "summary_error": summary_error})
+            elif not raw:
+                # summary 缺失或内容为空时降级该行，不能显示 benchmark_valid=True 但指标全 N/A。
+                summary_reason = "summary_missing" if not result.get("summary_json") else "summary_empty"
+                errors.append({"manifest_path": path, "summary_error": summary_reason})
             manifests.append(manifest)
             row = manifest_row(manifest, raw, self.work_dir, run_dir)
+            if summary_reason:
+                row["data_status"] = "unavailable"
+                row["benchmark_valid"] = False
+                if row.get("comparison_scope") == "official_agentx":
+                    row["comparison_scope"] = "invalid"
+                if not row.get("invalid_reasons"):
+                    row["invalid_reasons"] = [summary_reason]
             rows.append(row)
             # viz 重建时同步刷新各档位 summary 日志，保证屏幕与落盘口径一致。
-            self._write_summary_log(osp.join(self.work_dir, LOGS_DIR, row["run_id"]), row, run_dir)
+            raw_artifact_dir = (
+                osp.join(run_dir, result["raw_artifacts"]) if result.get("raw_artifacts") else None
+            )
+            self._write_summary_log(osp.join(self.work_dir, LOGS_DIR, row["run_id"]), row, raw_artifact_dir)
 
         if print_table:
             self.print_rows(rows)

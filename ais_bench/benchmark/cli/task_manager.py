@@ -23,21 +23,15 @@ class TaskManager:
 
         from ais_bench.benchmark.cli.workers import WORK_FLOW, WorkFlowExecutor
         run_mode = self.args.mode
-        reuse_without_run = False
-        if run_mode in ("perf", "agentx") and self.args.reuse:
+        # --reuse 在 perf 模式跳过执行、只做汇总；AgentX 模式只复用目录
+        # （沿用已有时间戳目录并覆盖原结果），不改变工作流。
+        if run_mode == "perf" and self.args.reuse:
             self.logger.warning(
-                "Detected --reuse in %s mode. Execution will be skipped and existing "
-                "results will be loaded from the reuse work dir.", run_mode,
+                "Detected --reuse in perf mode. Execution will be skipped and existing "
+                "results will be loaded from the reuse work dir."
             )
-            if run_mode == "perf":
-                run_mode = "perf_viz"
-            else:
-                # AgentX 无独立 viz 模式，reuse 时只保留汇总 worker。
-                reuse_without_run = True
+            run_mode = "perf_viz"
         self.workflow = [worker_class(self.args) for worker_class in WORK_FLOW.get(run_mode)]
-        if reuse_without_run:
-            self.workflow = [worker for worker in self.workflow
-                             if worker.__class__.__name__ != "AgentXRun"]
         if self.args.mode == "agentx" and self.args.dry_run:
             # dry-run 只输出执行计划，不尝试汇总不存在的正式结果。
             self.workflow = [worker for worker in self.workflow
