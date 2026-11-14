@@ -118,6 +118,11 @@ class TestAgentXFakeHarnessIntegration(unittest.TestCase):
                       "models": {"status": "ok", "error": None}},
             "collected_at": "2026-01-01T00:00:00+00:00",
         }
+        # _probe_engine 必须替换成可调用对象；直接 patch 成 (engine, errors) 元组时
+        # 调用会抛 TypeError 并被 _execute_plan 的容错分支吞掉，engine 恒为 None。
+        probe = (
+            probe_engine if probe_engine is not None else mock.Mock(return_value=(engine, []))
+        )
         with mock.patch(
             "ais_bench.benchmark.tasks.custom_tasks.agentx_task.resolve_harness_python",
             return_value=sys.executable,
@@ -125,7 +130,7 @@ class TestAgentXFakeHarnessIntegration(unittest.TestCase):
             "ais_bench.benchmark.tasks.custom_tasks.agentx_task.probe_harness_environment",
             return_value=metadata,
         ), mock.patch.object(
-            AgentXTask, "_probe_engine", probe_engine if probe_engine is not None else (engine, [])
+            AgentXTask, "_probe_engine", probe
         ), mock.patch.dict(os.environ, {"FAKE_AGENTX_MODE": mode}, clear=False):
             return task.run()
 

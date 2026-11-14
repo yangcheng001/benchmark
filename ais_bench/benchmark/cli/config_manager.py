@@ -1,6 +1,7 @@
 import copy
 import os
 import os.path as osp
+import re
 import inspect
 import json
 import tabulate
@@ -1177,10 +1178,28 @@ class ConfigManager:
             'key', 'token', 'secret', 'password', 'credential', 'authorization',
         ))
 
+    _AGENTX_SECRET_ARG_RE = re.compile(
+        r'(--[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|credential|authorization)'
+        r'[A-Za-z0-9_-]*)(=|\s+)(\S+)',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _redact_secret_argv_text(cls, text):
+        # 透传参数串（--agentx-extra-arg / 数据集 extra_args）里的敏感选项值同样要脱敏，
+        # 否则会以明文写进 configs/<时间戳>_<pid>.py 快照。
+        return cls._AGENTX_SECRET_ARG_RE.sub(
+            lambda match: match.group(1) + match.group(2) + '<redacted>', str(text)
+        )
+
     def _redact_agentx_snapshot(self, cfg):
         cli_args = cfg.get('cli_args') or {}
         if cli_args.get('api_key') is not None:
             cli_args['api_key'] = '<redacted>'
+        if cli_args.get('agentx_extra_arg') is not None:
+            cli_args['agentx_extra_arg'] = self._redact_secret_argv_text(
+                cli_args['agentx_extra_arg']
+            )
         if cli_args.get('agentx_env'):
             redacted_items = []
             for item in cli_args['agentx_env']:
@@ -1198,6 +1217,10 @@ class ConfigManager:
             for key in env:
                 if self._agentx_secret_key(key):
                     env[key] = '<redacted>'
+            if dataset_args.get('extra_args') is not None:
+                dataset_args['extra_args'] = self._redact_secret_argv_text(
+                    dataset_args['extra_args']
+                )
 
     def _restore_agentx_secrets(self, original, restored):
         original_cli = original.get('cli_args') or {}
@@ -1206,6 +1229,8 @@ class ConfigManager:
             restored_cli['api_key'] = original_cli['api_key']
         if original_cli.get('agentx_env') is not None:
             restored_cli['agentx_env'] = original_cli['agentx_env']
+        if original_cli.get('agentx_extra_arg') is not None:
+            restored_cli['agentx_extra_arg'] = original_cli['agentx_extra_arg']
         for source, target in zip(original.get('models') or [], restored.get('models') or []):
             if source.get('api_key') is not None:
                 target['api_key'] = source['api_key']
@@ -1216,6 +1241,8 @@ class ConfigManager:
                 target_args['api_key'] = source_args['api_key']
             if source_args.get('env') is not None:
                 target_args['env'] = source_args['env']
+            if source_args.get('extra_args') is not None:
+                target_args['extra_args'] = source_args['extra_args']
 
     def _dump_and_reload_config(self):
         # dump config

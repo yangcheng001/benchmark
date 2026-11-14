@@ -273,7 +273,14 @@ class TestAgentXConfigManager(AgentXCLITestBase):
         }
 
     def test_snapshot_is_redacted_and_memory_secrets_are_restored(self):
-        args = self.parse("--api-key", "secret", "--agentx-env", "API_TOKEN=env-token-value", "--agentx-env", "PUBLIC=visible")
+        args = self.parse(
+            "--api-key", "secret",
+            "--agentx-env", "API_TOKEN=env-token-value",
+            "--agentx-env", "PUBLIC=visible",
+            # 与真实用法一致带花括号：裸的 "--api-key=..." 会被 argparse 当成 AISBench 自己的
+            # --api-key 选项，导致 --agentx-extra-arg 缺少参数。
+            "--agentx-extra-arg", "{ --api-key=extra-secret --max-context-length 204800 }",
+        )
         manager = ConfigManager(args)
         manager.cfg_time_str = "20261106_000000"
         manager.cfg = Config({
@@ -285,6 +292,7 @@ class TestAgentXConfigManager(AgentXCLITestBase):
                     "concurrency": 1,
                     "api_key": "secret",
                     "env": {"API_TOKEN": "env-token-value", "PUBLIC": "visible"},
+                    "extra_args": "--api-key=extra-secret",
                 },
             }],
             "cli_args": vars(args),
@@ -298,10 +306,18 @@ class TestAgentXConfigManager(AgentXCLITestBase):
         self.assertNotIn("env-token-value", content)
         self.assertIn("<redacted>", content)
         self.assertIn("visible", content)
+        self.assertIn("--max-context-length 204800", content)
         self.assertEqual(manager.cfg["models"][0]["api_key"], "secret")
         self.assertEqual(manager.cfg["datasets"][0]["args"]["api_key"], "secret")
         self.assertEqual(manager.cfg["datasets"][0]["args"]["env"]["API_TOKEN"], "env-token-value")
         self.assertEqual(manager.cfg["datasets"][0]["args"]["env"]["PUBLIC"], "visible")
+        self.assertEqual(
+            manager.cfg["cli_args"]["agentx_extra_arg"],
+            "{ --api-key=extra-secret --max-context-length 204800 }",
+        )
+        self.assertEqual(
+            manager.cfg["datasets"][0]["args"]["extra_args"], "--api-key=extra-secret"
+        )
 
 
 class TestAgentXLifecycle(unittest.TestCase):

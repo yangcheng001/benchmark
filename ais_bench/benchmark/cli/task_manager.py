@@ -23,8 +23,9 @@ class TaskManager:
 
         from ais_bench.benchmark.cli.workers import WORK_FLOW, WorkFlowExecutor
         run_mode = self.args.mode
-        # --reuse 在 perf 模式跳过执行、只做汇总；AgentX 模式只复用目录
-        # （沿用已有时间戳目录并覆盖原结果），不改变工作流。
+        # --reuse 只做一件事：指定 --work-dir 下已有的时间戳目录，继续执行并覆盖原结果。
+        # 是否执行、是否只出汇总，由 --mode 决定（汇总对应 perf_viz / agentx 的 AgentXViz）。
+        # perf 模式与 reuse 同用时按历史行为降级为 perf_viz；AgentX 模式不改变工作流。
         if run_mode == "perf" and self.args.reuse:
             self.logger.warning(
                 "Detected --reuse in perf mode. Execution will be skipped and existing "

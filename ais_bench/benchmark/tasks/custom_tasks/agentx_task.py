@@ -528,9 +528,10 @@ def _safe_component(value: Any) -> str:
 
 def _redact_text(text: str, secrets: List[str]) -> str:
     result = text
-    for secret in secrets:
-        if secret:
-            result = result.replace(secret, "<redacted>")
+    # 长值优先替换：api_key="secret" 是 "--agentx-extra-arg --api-key extra-secret"
+    # 的子串，先替换短值会残留 "extra-<redacted>"，导致回显并非完整脱敏。
+    for secret in sorted({str(item) for item in secrets if item}, key=len, reverse=True):
+        result = result.replace(secret, "<redacted>")
     result = re.sub(r"(?i)(authorization|proxy-authorization|x-api-key|x-auth-token)\s*[:=]\s*\S+",
                     r"\1:<redacted>", result)
     result = re.sub(r"(--api-key(?:=|\s+))\S+", r"\1<redacted>", result)
